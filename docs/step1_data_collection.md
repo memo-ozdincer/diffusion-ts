@@ -34,9 +34,32 @@ Raw 3N×3N Hessians include 5–6 near-zero eigenvalues from translation (3) and
 
 For isopropanol (N=12): 36 DOF → 30 vibrational DOF after Eckart projection.
 
-### DFTB0 only
+### DFTB0 only — DFTB2/DFTB3 crash during GAD
 
-DFTB0 provides analytical Hessians (fast, reliable). DFTB2 and DFTB3 use semi-numerical Hessians that crash during GAD dynamics ("Gradient calculation in semi-numerical Hessian evaluation failed"). This is not a noise or multiprocessing issue — it's a SCINE Sparrow limitation. DFTB1 does not exist as a method.
+We tested all available DFTB variants in SCINE Sparrow. Only DFTB0 is viable for the full NR→GAD pipeline.
+
+**DFTB0 (non-self-consistent tight binding):**
+- Analytical Hessians — fast, numerically stable, exact derivatives
+- Works reliably through both NR and GAD phases
+- All production data collected with DFTB0
+
+**DFTB2 (self-consistent charge, SCC-DFTB):**
+- Single-point energy/force/Hessian works on both clean and noisy geometries
+- **Crashes during GAD dynamics** with: `RuntimeError: Gradient calculation in semi-numerical Hessian evaluation failed`
+- The failure occurs because DFTB2 uses **semi-numerical Hessians** (finite-difference of analytical gradients). During GAD, the geometry moves to regions where the SCF procedure fails to converge for the displaced geometries used in the finite-difference stencil, even though it converges for the central geometry.
+- Confirmed NOT a multiprocessing issue — crashes identically in single-process mode (`scripts/test_dftb_single_process.py`)
+- Confirmed NOT a noise issue — crashes even from clean equilibrium geometry after a few GAD steps
+
+**DFTB3 (3rd-order expansion, DFTB3-D3BJ):**
+- Same behavior as DFTB2: single-point works, GAD crashes
+- Same root cause: semi-numerical Hessians fail during dynamics
+
+**DFTB1:**
+- Does not exist as a method in SCINE Sparrow. The naming goes DFTB0 → DFTB2 → DFTB3.
+
+**Root cause:** SCINE Sparrow's `HessianCalculator` for SCC methods (DFTB2/3) performs central finite differences of the gradient. Each finite-difference displacement creates a slightly perturbed geometry that requires its own SCF convergence. Near saddle points or in distorted geometries (which GAD deliberately explores), these displaced geometries can land in regions where the SCF procedure diverges. DFTB0 avoids this entirely because its Hessian is analytical — no SCF, no finite differences.
+
+**Implication for Step 3:** The adjoint sampler's `grad_E` calls will also need Hessians (for the GAD vector field). Using SCINE directly limits us to DFTB0. A GPU-based ML surrogate trained on DFTB0 data would bypass this limitation entirely.
 
 ### State-based optimization
 
