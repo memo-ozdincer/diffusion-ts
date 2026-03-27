@@ -88,6 +88,12 @@ class GADConfig:
     project_gradient: bool = True        # Eckart-project gradient and v
     # Molecular safety
     min_interatomic_dist: float = 0.5
+    # Index-2 recovery: when stuck at n_neg=2 with low force, perturb along
+    # 2nd negative eigenvector. This can recover 5-10% of failures at high noise.
+    index2_recovery: bool = False
+    index2_patience: int = 200          # consecutive n_neg=2 steps before kick
+    index2_kick_scale: float = 0.3      # displacement magnitude (Angstrom)
+    index2_max_kicks: int = 3           # max number of kicks per run
 
 
 @dataclass
@@ -362,6 +368,8 @@ def run_nr_minimization(
         accepted = False
         retries = 0
         max_retries = 10
+        out_new = None
+        new_coords = None
 
         while not accepted and retries < max_retries:
             capped_disp = _cap_displacement(delta_x.reshape(-1, 3), trust_radius)
@@ -448,9 +456,11 @@ def run_nr_minimization(
                 retries += 1
 
         if not accepted:
-            # All retries failed — take last tried step anyway
-            coords = new_coords.detach()
-            out = out_new
+            # All retries failed — take last tried step if we evaluated it,
+            # otherwise stay at current position (all retries hit distance check)
+            if out_new is not None and new_coords is not None:
+                coords = new_coords.detach()
+                out = out_new
 
     # Did not converge within budget
     return {
@@ -478,10 +488,16 @@ def _compute_adaptive_dt(
     method: str,
     eig_0: float,
     eps: float = 1e-8,
+    dt_scale_factor: float = 1.0,
 ) -> float:
-    """State-based adaptive timestep. No path history needed."""
+    """State-based adaptive timestep. No path history needed.
+
+    Args:
+        dt_scale_factor: Global multiplier on the effective dt. Use < 1.0
+            (e.g. 0.5) at high noise for stability.
+    """
     if method == "none":
-        return dt_base
+        return dt_base * dt_scale_factor
 
     if method == "eigenvalue_clamped":
         # Clamp |lambda_0| to [1e-2, 1e2] to prevent extreme dt.
@@ -494,6 +510,7 @@ def _compute_adaptive_dt(
     else:
         dt_eff = dt_base
 
+    dt_eff *= dt_scale_factor
     return float(max(dt_min, min(dt_eff, dt_max)))
 
 
@@ -516,6 +533,10 @@ def run_gad_saddle_search(
     coords = coords0.detach().clone().to(torch.float32).reshape(-1, 3)
     v_prev: Optional[torch.Tensor] = None
     trajectory: List[Dict[str, Any]] = []
+
+    # Index-2 recovery state
+    consec_nneg2: int = 0
+    n_kicks_used: int = 0
 
     for step in range(cfg.n_steps):
         out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
@@ -555,6 +576,27 @@ def run_gad_saddle_search(
                 "trajectory": trajectory,
             }
 
+        # ---- Index-2 recovery: perturb along 2nd negative eigenvector ----
+        if cfg.index2_recovery:
+            if n_neg >= 2:
+                consec_nneg2 += 1
+            else:
+                consec_nneg2 = 0
+
+            if (consec_nneg2 >= cfg.index2_patience
+                    and n_kicks_used < cfg.index2_max_kicks
+                    and evecs_vib_3N.shape[1] >= 2):
+                # Perturb along the 2nd negative eigenvector (index 1)
+                v2 = evecs_vib_3N[:, 1].to(device=coords.device, dtype=coords.dtype)
+                v2 = v2 / (v2.norm() + 1e-12)
+                kick = cfg.index2_kick_scale * v2.reshape(-1, 3)
+                coords = coords + kick
+                consec_nneg2 = 0
+                n_kicks_used += 1
+                v_prev = None  # reset mode tracking after kick
+                record["index2_kick"] = True
+                continue  # re-evaluate at new position
+
         # ---- Mode tracking: pick guide vector ----
         # Use bottom-k eigenvectors from the reduced-basis Hessian
         k_track = min(8, evecs_vib_3N.shape[1])
@@ -583,6 +625,7 @@ def run_gad_saddle_search(
         dt_eff = _compute_adaptive_dt(
             cfg.dt, cfg.dt_min, cfg.dt_max,
             cfg.dt_adaptation, eig_0,
+            dt_scale_factor=cfg.dt_scale_factor,
         )
         record["dt_eff"] = dt_eff
 
