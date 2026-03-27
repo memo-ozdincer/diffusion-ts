@@ -2,7 +2,7 @@
 #SBATCH --job-name=diffusion-ts
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48
+#SBATCH --cpus-per-task=128
 #SBATCH --gpus-per-node=0
 #SBATCH --time=12:00:00
 #SBATCH --output=/scratch/memoozd/diffusion-ts/logs/%x_%j.out
@@ -62,7 +62,7 @@ export FONTCONFIG_FILE=/etc/fonts/fonts.conf
 mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$MPLCONFIGDIR"
 
 # ---- Threading ----
-TOTAL_CPUS="${SLURM_CPUS_ON_NODE:-48}"
+TOTAL_CPUS="${SLURM_CPUS_ON_NODE:-128}"
 export OMP_NUM_THREADS="$TOTAL_CPUS"
 export OPENBLAS_NUM_THREADS="$TOTAL_CPUS"
 export MKL_NUM_THREADS="$TOTAL_CPUS"
@@ -90,7 +90,7 @@ echo "=============================================="
 # =============================================================================
 # Example: NR minimization at noise=1.0A, 20k steps, RFO+PLS
 # =============================================================================
-python "$PROJECT_DIR/src/noisy/v2_tests/runners/run_minimization_parallel.py" \
+python "$PROJECT_DIR/src/benchmarks/runners/run_minimization_parallel.py" \
     --h5-path "$H5_PATH" \
     --out-dir "$OUT_DIR/nr_n1.0_20k" \
     --scine-functional "DFTB0" \
@@ -118,7 +118,7 @@ python "$PROJECT_DIR/src/noisy/v2_tests/runners/run_minimization_parallel.py" \
 ANALYSIS_DIR="${OUT_DIR}/analysis"
 mkdir -p "$ANALYSIS_DIR"
 
-python "$PROJECT_DIR/src/noisy/v2_tests/scripts/analyze_minimization_nr_grid.py" \
+python "$PROJECT_DIR/src/benchmarks/scripts/analyze_minimization_nr_grid.py" \
     --grid-dir "$OUT_DIR" \
     --result-glob "*/minimization_newton_raphson_*_results.json" \
     --output-dir "$ANALYSIS_DIR" \

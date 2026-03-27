@@ -68,12 +68,12 @@ from torch_geometric.loader import DataLoader
 
 from src.dependencies.common_utils import Transition1xDataset, UsePos, parse_starting_geometry
 from src.noisy.multi_mode_eckartmw import get_vib_evals_evecs, _atomic_nums_to_symbols
-from src.noisy.v2_tests.baselines.minimization import (
+from src.benchmarks.baselines.minimization import (
     CASCADE_THRESHOLDS,
     run_fixed_step_gd,
     run_newton_raphson,
 )
-from src.noisy.v2_tests.baselines.pic_arc import run_pic_arc
+from src.benchmarks.baselines.pic_arc import run_pic_arc
 from src.parallel.lj_parallel import ParallelLJProcessor
 from src.parallel.scine_parallel import ParallelSCINEProcessor
 from src.parallel.utils import run_batch_parallel

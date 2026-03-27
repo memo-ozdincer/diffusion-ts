@@ -45,7 +45,7 @@ from src.dependencies.differentiable_projection import (
     project_vector_to_vibrational_torch,
 )
 from src.noisy.multi_mode_eckartmw import get_vib_evals_evecs
-from src.noisy.v2_tests.baselines.minimization import (
+from src.benchmarks.baselines.minimization import (
     _bottom_k_spectrum,
     _cap_displacement,
     _cascade_n_neg,

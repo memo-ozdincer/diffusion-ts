@@ -8,14 +8,12 @@ torch>=2.0.0
 torch-geometric>=2.3.0
 
 # Transition state dataset
-transition1x
+-e ../transition1x
+-e ../hip
 
 # SCINE electronic structure
 scine-utilities
 scine-sparrow
-
-# ML potential (HIP-NN)
-hip-nn-ts
 
 # Hyperparameter search (used by some analysis scripts)
 optuna>=3.0.0

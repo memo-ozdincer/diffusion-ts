@@ -144,7 +144,7 @@ run_config() {
     COMBO=$((COMBO + 1))
     echo "[combo ${COMBO}]  ${tag}  (noise=${noise_level}A, steps=${n_steps})"
 
-    if python "$PROJECT_DIR/src/noisy/v2_tests/runners/run_minimization_parallel.py" \
+    if python "$PROJECT_DIR/src/benchmarks/runners/run_minimization_parallel.py" \
             --h5-path "$H5_PATH" \
             --out-dir "$run_out" \
             --scine-functional "$SCINE_FUNCTIONAL" \
@@ -276,7 +276,7 @@ ANALYSIS_DIR="${OUT_DIR}/analysis"
 mkdir -p "$ANALYSIS_DIR"
 
 echo "Running grid analysis ..."
-python "$PROJECT_DIR/src/noisy/v2_tests/scripts/analyze_minimization_nr_grid.py" \
+python "$PROJECT_DIR/src/benchmarks/scripts/analyze_minimization_nr_grid.py" \
     --grid-dir "$OUT_DIR" \
     --result-glob "*/minimization_newton_raphson_*_results.json" \
     --output-dir "$ANALYSIS_DIR" \
@@ -285,7 +285,7 @@ python "$PROJECT_DIR/src/noisy/v2_tests/scripts/analyze_minimization_nr_grid.py"
 echo "Running failure autopsy ..."
 AUTOPSY_DIR="${OUT_DIR}/autopsy"
 mkdir -p "$AUTOPSY_DIR"
-python "$PROJECT_DIR/src/noisy/v2_tests/scripts/analyze_nr_failure_autopsy.py" \
+python "$PROJECT_DIR/src/benchmarks/scripts/analyze_nr_failure_autopsy.py" \
     --grid-dir "$OUT_DIR" \
     --output-dir "$AUTOPSY_DIR" > "${AUTOPSY_DIR}/autopsy_report.txt" 2>&1 || true
 
