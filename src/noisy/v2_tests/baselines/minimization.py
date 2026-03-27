@@ -1,0 +1,3338 @@
+"""Minimization baselines: fixed-step gradient descent and Newton-Raphson.
+
+Both methods find energy MINIMA on the potential energy surface.
+
+1. Fixed-step gradient descent:
+   x_{k+1} = x_k - alpha * grad E(x_k)
+   = x_k + alpha * forces(x_k)
+
+2. Newton-Raphson:
+   x_{k+1} = x_k - H(x_k)^{-1} * grad E(x_k)
+   = x_k + H(x_k)^{-1} * forces(x_k)
+
+   The inverse Hessian is computed via pseudoinverse in the vibrational
+   subspace to avoid singularities from translation/rotation modes.
+
+Both support optional Eckart projection of the gradient to prevent
+translation/rotation drift.
+
+Algorithmic improvements (v2):
+  - Cascading evaluation: n_neg counted at 8 thresholds so analysis can
+    distinguish "optimizer found good geometry but evaluation too strict"
+    from "optimizer genuinely failed". Logged in every trajectory step.
+  - Levenberg-Marquardt (LM) damping: smooth alternative to hard filtering.
+    step_i = (g·v_i) * |λ_i| / (λ_i² + μ²)
+    Activated when lm_mu > 0; otherwise falls back to hard filter.
+  - Two-phase threshold annealing: bulk optimization uses nr_threshold;
+    once force_norm < anneal_force_threshold the threshold is dropped to
+    cleanup_nr_threshold for a capped number of cleanup steps.
+  - Spectral gap diagnostic: |λ_min| / |λ_second_min| on the vibrational
+    eigenvalues, logged every step.
+  - Full bottom-K vibrational spectrum logged at every step.
+
+Algorithmic improvements (v3):
+  - Shifted Newton step: step_i = (g·v_i) / (λ_i + σ), where
+    σ = max(0, -λ_min) + shift_epsilon. Standard Levenberg shift that
+    makes all effective eigenvalues positive. Negative modes get LARGER
+    weights than equally-sized positive modes → more aggressive along
+    the problematic directions.
+  - Stagnation-triggered negative-mode perturbation: when n_neg is
+    unchanged for stagnation_window steps and negative eigenvalues are
+    small, apply a targeted displacement along the negative eigenvectors.
+  - Adaptive LM μ annealing: when close to convergence (few small negative
+    eigenvalues), reduce μ to let the optimizer take more aggressive steps.
+  - Negative-mode line search: when stagnated with persistent negative
+    modes, scan along the negative eigenvector to find where curvature
+    changes sign.
+  - Trust-region fixes: higher floor, reset after escape, gradient-norm
+    based minimum step size to prevent optimizer from getting stuck with
+    tiny displacements.
+  - Per-step diagnostic logging: gradient-mode overlap for negative modes,
+    step-mode decomposition, stagnation counter, energy plateau detection.
+"""
+
+from __future__ import annotations
+
+import random
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+
+from src.dependencies.differentiable_projection import (
+    project_vector_to_vibrational_torch,
+)
+from src.noisy.multi_mode_eckartmw import get_vib_evals_evecs
+
+
+# ---------------------------------------------------------------------------
+# Cascade evaluation thresholds (never change the optimizer; pure diagnostics)
+# ---------------------------------------------------------------------------
+CASCADE_THRESHOLDS: List[float] = [0.0, 1e-4, 5e-4, 1e-3, 2e-3, 5e-3, 8e-3, 1e-2]
+
+
+def _cascade_n_neg(evals_vib: torch.Tensor) -> Dict[str, int]:
+    """Return n_neg counted at each cascade threshold.
+
+    Key format: "n_neg_at_<threshold>" where threshold is stringified as
+    the repr of the float (e.g. "n_neg_at_0.0", "n_neg_at_0.001").
+    This is safe for JSON serialization and unambiguous in CSVs.
+    """
+    result: Dict[str, int] = {}
+    for thr in CASCADE_THRESHOLDS:
+        result[f"n_neg_at_{thr}"] = int((evals_vib < -thr).sum().item())
+    return result
+
+
+def _eigenvalue_band_populations(evals_vib: torch.Tensor) -> Dict[str, int]:
+    """Count eigenvalues in 8 magnitude bands for detailed spectral analysis.
+
+    Bands span from strongly negative through near-zero to positive,
+    enabling ghost-mode detection (eigenvalues in [-1e-4, 0) with none
+    below -1e-4).
+    """
+    result: Dict[str, int] = {}
+    result["n_eval_below_neg1e-1"] = int((evals_vib < -0.1).sum().item())
+    result["n_eval_neg1e-1_to_neg1e-2"] = int(
+        ((evals_vib >= -0.1) & (evals_vib < -0.01)).sum().item()
+    )
+    result["n_eval_neg1e-2_to_neg1e-3"] = int(
+        ((evals_vib >= -0.01) & (evals_vib < -0.001)).sum().item()
+    )
+    result["n_eval_neg1e-3_to_neg1e-4"] = int(
+        ((evals_vib >= -0.001) & (evals_vib < -1e-4)).sum().item()
+    )
+    result["n_eval_neg1e-4_to_0"] = int(
+        ((evals_vib >= -1e-4) & (evals_vib < 0.0)).sum().item()
+    )
+    result["n_eval_0_to_pos1e-4"] = int(
+        ((evals_vib >= 0.0) & (evals_vib < 1e-4)).sum().item()
+    )
+    result["n_eval_pos1e-4_to_pos1e-3"] = int(
+        ((evals_vib >= 1e-4) & (evals_vib < 0.001)).sum().item()
+    )
+    result["n_eval_above_pos1e-3"] = int((evals_vib >= 0.001).sum().item())
+    return result
+
+
+def _spectral_conditioning_diagnostics(
+    evals_vib: torch.Tensor,
+    prev_evals_vib: Optional[torch.Tensor],
+    tau_hard: float,
+    tau_soft: float,
+) -> Dict[str, Any]:
+    """Compute detailed spectral conditioning diagnostics.
+
+    Partitions the spectrum into hard/soft/null regimes and reports
+    condition numbers, eigenvalue ranges, and step-to-step change rates.
+    """
+    abs_evals = torch.abs(evals_vib)
+    n_modes = evals_vib.numel()
+    if n_modes == 0:
+        return {"n_total": 0}
+
+    hard_pos_mask = evals_vib > tau_hard
+    hard_neg_mask = evals_vib < -tau_hard
+    soft_mask = (abs_evals > tau_soft) & (abs_evals <= tau_hard)
+    null_mask = abs_evals <= tau_soft
+
+    n_hard_pos = int(hard_pos_mask.sum().item())
+    n_hard_neg = int(hard_neg_mask.sum().item())
+    n_soft = int(soft_mask.sum().item())
+    n_null = int(null_mask.sum().item())
+
+    # Condition numbers
+    pos_evals = evals_vib[evals_vib > 0]
+    neg_evals = evals_vib[evals_vib < 0]
+
+    cond_full = float(abs_evals.max().item() / max(abs_evals.min().item(), 1e-30))
+
+    cond_hard = float("nan")
+    hard_mask = abs_evals > tau_hard
+    if hard_mask.any():
+        hard_abs = abs_evals[hard_mask]
+        cond_hard = float(hard_abs.max().item() / hard_abs.min().item())
+
+    # Eigenvalue range and spread
+    eval_range = float(evals_vib.max().item() - evals_vib.min().item())
+    eval_spread_pos = (
+        float(pos_evals.max().item() - pos_evals.min().item())
+        if pos_evals.numel() > 1 else 0.0
+    )
+    eval_spread_neg = (
+        float(neg_evals.min().item() - neg_evals.max().item())
+        if neg_evals.numel() > 1 else 0.0
+    )
+
+    # Step-to-step change rate
+    eval_change_rate_mean: Optional[float] = None
+    eval_max_change: Optional[float] = None
+    eval_change_rate_hard: Optional[float] = None
+    if prev_evals_vib is not None and prev_evals_vib.numel() == n_modes:
+        changes = torch.abs(evals_vib - prev_evals_vib)
+        rel_changes = changes / torch.clamp(torch.abs(prev_evals_vib), min=1e-10)
+        eval_change_rate_mean = float(rel_changes.mean().item())
+        eval_max_change = float(changes.max().item())
+        if hard_mask.any():
+            eval_change_rate_hard = float(rel_changes[hard_mask].mean().item())
+
+    return {
+        "n_hard_pos": n_hard_pos,
+        "n_hard_neg": n_hard_neg,
+        "n_soft": n_soft,
+        "n_null": n_null,
+        "n_total": n_modes,
+        "cond_full": cond_full,
+        "cond_hard_only": cond_hard,
+        "eval_range": eval_range,
+        "eval_spread_positive": eval_spread_pos,
+        "eval_spread_negative": eval_spread_neg,
+        "eval_change_rate_mean": eval_change_rate_mean,
+        "eval_max_change": eval_max_change,
+        "eval_change_rate_hard": eval_change_rate_hard,
+        "min_pos_eval": float(pos_evals.min().item()) if pos_evals.numel() > 0 else None,
+        "max_neg_eval": float(neg_evals.max().item()) if neg_evals.numel() > 0 else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _to_float(x) -> float:
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().reshape(-1)[0].item())
+    return float(x)
+
+
+def _force_mean(forces: torch.Tensor) -> float:
+    if forces.dim() == 3 and forces.shape[0] == 1:
+        forces = forces[0]
+    f = forces.reshape(-1, 3)
+    return float(f.norm(dim=1).mean().item())
+
+
+def _cubic_interval_minimum(
+    energy_prev: float,
+    energy_curr: float,
+    deriv_prev: float,
+    deriv_curr: float,
+    *,
+    t_lo: float = 0.1,
+    t_hi: float = 0.9,
+) -> Optional[Dict[str, float]]:
+    """Fit cubic p(t) on [0,1] and return an interior local minimum.
+
+    Constraints:
+      p(0)=E_prev, p(1)=E_curr, p'(0)=deriv_prev, p'(1)=deriv_curr.
+
+    `deriv_prev/deriv_curr` are directional derivatives with respect to the
+    unitless interpolation coordinate t in x(t)=x_prev+t*(x_curr-x_prev).
+    """
+    if not (0.0 < t_lo < t_hi < 1.0):
+        return None
+
+    # p(t)=a t^3 + b t^2 + c t + d
+    d = energy_prev
+    c = deriv_prev
+    y1 = energy_curr - energy_prev - deriv_prev
+    y2 = deriv_curr - deriv_prev
+    a = y2 - 2.0 * y1
+    b = 3.0 * y1 - y2
+
+    candidates: List[float] = []
+    eps = 1e-14
+
+    # p'(t)=3 a t^2 + 2 b t + c
+    if abs(a) < eps:
+        if abs(b) > eps:
+            t = -c / (2.0 * b)
+            candidates.append(t)
+    else:
+        disc = 4.0 * b * b - 12.0 * a * c
+        if disc >= 0.0:
+            sqrt_disc = disc ** 0.5
+            denom = 6.0 * a
+            if abs(denom) > eps:
+                candidates.append((-2.0 * b - sqrt_disc) / denom)
+                candidates.append((-2.0 * b + sqrt_disc) / denom)
+
+    best_t: Optional[float] = None
+    best_e = float("inf")
+    for t in candidates:
+        if not (t_lo < t < t_hi):
+            continue
+        second = 6.0 * a * t + 2.0 * b
+        if second <= 0.0:
+            continue
+        e_t = ((a * t + b) * t + c) * t + d
+        if e_t < best_e:
+            best_t = t
+            best_e = e_t
+
+    if best_t is None or not (best_e < energy_curr):
+        return None
+
+    return {
+        "t_star": float(best_t),
+        "predicted_energy": float(best_e),
+        "a": float(a),
+        "b": float(b),
+        "c": float(c),
+        "d": float(d),
+    }
+
+
+def _min_interatomic_distance(coords: torch.Tensor) -> float:
+    if coords.dim() == 3 and coords.shape[0] == 1:
+        coords = coords[0]
+    coords = coords.reshape(-1, 3)
+    n = coords.shape[0]
+    if n < 2:
+        return float("inf")
+    diff = coords.unsqueeze(0) - coords.unsqueeze(1)
+    dist = diff.norm(dim=2)
+    dist = dist + torch.eye(n, device=coords.device, dtype=coords.dtype) * 1e10
+    return float(dist.min().item())
+
+
+def _cap_displacement(step_disp: torch.Tensor, max_atom_disp: float) -> torch.Tensor:
+    """Cap per-atom displacement to max_atom_disp."""
+    disp_3d = step_disp.reshape(-1, 3)
+    max_disp = float(disp_3d.norm(dim=1).max().item())
+    if max_disp > max_atom_disp and max_disp > 0:
+        disp_3d = disp_3d * (max_atom_disp / max_disp)
+    return disp_3d.reshape(step_disp.shape)
+
+
+def _cap_displacement_split(
+    step_disp: torch.Tensor,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    pos_trust_radius: float,
+    neg_trust_radius: float,
+) -> torch.Tensor:
+    """Cap step displacement with separate trust radii for pos/neg eigenvalue subspaces.
+
+    Decomposes step_disp into:
+      - neg-mode component: projection onto eigenvectors with eigenvalue < 0
+      - pos-mode component: everything else (pos eigenvalues + residual)
+
+    Caps each component independently with its own trust radius, then recombines.
+    This prevents the pos-mode trust radius collapse from crushing neg-mode steps.
+    """
+    neg_mask = evals_vib < 0.0
+    if not neg_mask.any():
+        return _cap_displacement(step_disp, pos_trust_radius)
+
+    work_dtype = evecs_vib_3N.dtype
+    disp_flat = step_disp.reshape(-1).to(dtype=work_dtype)
+
+    neg_evecs = evecs_vib_3N[:, neg_mask]  # (3N, n_neg)
+
+    # Project onto negative subspace
+    coeffs_neg = neg_evecs.T @ disp_flat       # (n_neg,)
+    neg_component = neg_evecs @ coeffs_neg     # (3N,)
+    pos_component = disp_flat - neg_component  # (3N,) remainder
+
+    # Cap each independently
+    orig_dtype = step_disp.dtype
+    neg_capped = _cap_displacement(
+        neg_component.to(dtype=orig_dtype).reshape(-1, 3), neg_trust_radius
+    ).reshape(-1)
+    pos_capped = _cap_displacement(
+        pos_component.to(dtype=orig_dtype).reshape(-1, 3), pos_trust_radius
+    ).reshape(-1)
+
+    return (neg_capped + pos_capped).reshape(step_disp.shape)
+
+
+def _bottom_k_spectrum(evals_vib: torch.Tensor, k: int = 10) -> List[float]:
+    """Return the k smallest vibrational eigenvalues as a sorted Python list."""
+    vals = evals_vib.detach().cpu()
+    sorted_vals, _ = torch.sort(vals)
+    return [float(v) for v in sorted_vals[:k].tolist()]
+
+
+def _spectral_gap_info(evals_vib: torch.Tensor) -> Dict[str, Any]:
+    """Spectral gap diagnostic for the vibrational eigenvalue spectrum.
+
+    Computes |λ_min| / |λ_second_min| to detect an isolated dominant negative
+    mode.  A large ratio signals transition-state-like character (one mode
+    dominates the negative part of the spectrum).
+
+    Returns:
+        spectral_gap_ratio: |λ₀|/|λ₁| where λ₀ < λ₁ are the two most
+            negative vibrational eigenvalues.  inf if exactly 1 negative
+            eigenvalue; nan if 0 negative eigenvalues.
+        dominant_neg_mode: True if exactly 1 negative eigenvalue, or
+            the gap ratio exceeds 10.
+    """
+    if evals_vib.numel() < 2:
+        return {"spectral_gap_ratio": float("nan"), "dominant_neg_mode": False}
+
+    sorted_evals = torch.sort(evals_vib).values  # ascending
+    lam0 = float(sorted_evals[0].item())
+    lam1 = float(sorted_evals[1].item())
+
+    if lam0 >= 0:
+        # No negative eigenvalues
+        return {"spectral_gap_ratio": float("nan"), "dominant_neg_mode": False}
+
+    if lam1 >= 0:
+        # single negative eigenvalue, perfectly isolated
+        return {"spectral_gap_ratio": float("inf"), "dominant_neg_mode": True}
+
+    # Both negative
+    ratio = abs(lam0) / abs(lam1)
+    return {"spectral_gap_ratio": ratio, "dominant_neg_mode": ratio > 10.0}
+
+
+def _total_hessian_n_neg(hessian: torch.Tensor) -> int:
+    """Count negative eigenvalues of the full (unprojected) Hessian."""
+    H = hessian.detach()
+    if H.dim() == 4:
+        n = H.shape[0]
+        H = H.reshape(3 * n, 3 * n)
+    elif H.dim() == 3 and H.shape[0] == 1:
+        H = H.squeeze(0)
+    H = 0.5 * (H + H.T)  # symmetrise for numerical safety
+    evals = torch.linalg.eigvalsh(H)
+    return int((evals < 0.0).sum().item())
+
+
+# ---------------------------------------------------------------------------
+# v3 diagnostic: gradient-mode overlap for negative modes
+# ---------------------------------------------------------------------------
+
+def _neg_mode_diagnostics(
+    grad: torch.Tensor,
+    delta_x: torch.Tensor,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+) -> Dict[str, Any]:
+    """Compute per-step diagnostics for negative vibrational modes.
+
+    Returns:
+        neg_mode_grad_overlaps: list of |g·v_i|/|g| for each negative mode i,
+            sorted by eigenvalue (most negative first). If near zero, the NR
+            step cannot address that mode.
+        neg_mode_eigenvalues: the negative eigenvalues themselves.
+        step_along_neg_frac: fraction of ||delta_x||² that lies in the
+            negative-eigenvalue subspace.
+        step_along_pos_frac: fraction in the positive-eigenvalue subspace.
+        max_neg_grad_overlap: the largest gradient-mode overlap among negatives.
+        min_neg_grad_overlap: the smallest (bottleneck mode).
+    """
+    neg_mask = evals_vib < 0.0
+    n_neg = int(neg_mask.sum().item())
+    if n_neg == 0:
+        return {
+            "neg_mode_grad_overlaps": [],
+            "neg_mode_eigenvalues": [],
+            "step_along_neg_frac": 0.0,
+            "step_along_pos_frac": 1.0,
+            "max_neg_grad_overlap": float("nan"),
+            "min_neg_grad_overlap": float("nan"),
+        }
+
+    # Cast everything to the same dtype (use the eigenvector dtype = float64)
+    work_dtype = evecs_vib_3N.dtype
+    grad_w = grad.to(dtype=work_dtype)
+    delta_x_w = delta_x.to(dtype=work_dtype)
+
+    grad_norm = float(grad_w.norm().item())
+    if grad_norm < 1e-30:
+        grad_norm = 1e-30
+
+    neg_evals = evals_vib[neg_mask]
+    neg_evecs = evecs_vib_3N[:, neg_mask]  # (3N, n_neg)
+
+    # Sort by eigenvalue ascending (most negative first)
+    sort_idx = torch.argsort(neg_evals)
+    neg_evals = neg_evals[sort_idx]
+    neg_evecs = neg_evecs[:, sort_idx]
+
+    # Gradient overlap with each negative mode
+    grad_projs = neg_evecs.T @ grad_w  # (n_neg,)
+    overlaps = (grad_projs.abs() / grad_norm).tolist()
+    neg_eval_list = neg_evals.tolist()
+
+    # Step decomposition: what fraction of the step is along negative modes?
+    dx_norm_sq = float((delta_x_w ** 2).sum().item())
+    if dx_norm_sq < 1e-30:
+        return {
+            "neg_mode_grad_overlaps": overlaps,
+            "neg_mode_eigenvalues": neg_eval_list,
+            "step_along_neg_frac": 0.0,
+            "step_along_pos_frac": 0.0,
+            "max_neg_grad_overlap": max(overlaps) if overlaps else float("nan"),
+            "min_neg_grad_overlap": min(overlaps) if overlaps else float("nan"),
+        }
+
+    dx_in_neg = neg_evecs.T @ delta_x_w  # (n_neg,)
+    neg_frac = float((dx_in_neg ** 2).sum().item()) / dx_norm_sq
+
+    pos_mask = evals_vib > 0.0
+    if pos_mask.any():
+        pos_evecs = evecs_vib_3N[:, pos_mask]
+        dx_in_pos = pos_evecs.T @ delta_x_w
+        pos_frac = float((dx_in_pos ** 2).sum().item()) / dx_norm_sq
+    else:
+        pos_frac = 0.0
+
+    return {
+        "neg_mode_grad_overlaps": overlaps,
+        "neg_mode_eigenvalues": neg_eval_list,
+        "step_along_neg_frac": neg_frac,
+        "step_along_pos_frac": pos_frac,
+        "max_neg_grad_overlap": max(overlaps),
+        "min_neg_grad_overlap": min(overlaps),
+    }
+
+
+# ---------------------------------------------------------------------------
+# v5 diagnostic: eigenvector continuity between consecutive steps
+# ---------------------------------------------------------------------------
+
+def _eigenvector_continuity(
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    prev_neg_evecs: Optional[torch.Tensor],
+    prev_neg_evals: Optional[torch.Tensor],
+) -> Dict[str, Any]:
+    """Compute overlap matrix between consecutive steps' negative eigenvectors.
+
+    For each current negative mode v_i^k, finds best match in previous step
+    via overlap = |<v_i^k | v_j^{k-1}>|. Low overlap indicates mode rotation
+    (different modes entering/leaving the negative subspace).
+
+    Returns:
+        mode_continuity_min: worst overlap across current neg modes
+        mode_continuity_mean: average overlap
+        n_mode_rotation_events: modes with best overlap < 0.5
+        n_neg_current, n_neg_previous: neg mode counts
+    """
+    neg_mask = evals_vib < 0.0
+    n_neg_current = int(neg_mask.sum().item())
+
+    if n_neg_current == 0 or prev_neg_evecs is None:
+        return {
+            "mode_continuity_min": float("nan"),
+            "mode_continuity_mean": float("nan"),
+            "n_mode_rotation_events": 0,
+            "n_neg_current": n_neg_current,
+            "n_neg_previous": 0 if prev_neg_evecs is None else int(prev_neg_evecs.shape[1]),
+        }
+
+    n_neg_prev = prev_neg_evecs.shape[1]
+    if n_neg_prev == 0:
+        return {
+            "mode_continuity_min": float("nan"),
+            "mode_continuity_mean": float("nan"),
+            "n_mode_rotation_events": 0,
+            "n_neg_current": n_neg_current,
+            "n_neg_previous": 0,
+        }
+
+    # Current negative eigenvectors: (3N, n_neg_current)
+    cur_neg_evecs = evecs_vib_3N[:, neg_mask]
+
+    # Overlap matrix: (n_neg_current, n_neg_prev) = |cur^T @ prev|
+    overlap_matrix = torch.abs(cur_neg_evecs.T @ prev_neg_evecs)
+
+    # For each current mode, find best overlap with any previous mode
+    best_overlaps = overlap_matrix.max(dim=1).values  # (n_neg_current,)
+    best_overlaps_list = best_overlaps.tolist()
+
+    continuity_min = min(best_overlaps_list)
+    continuity_mean = sum(best_overlaps_list) / len(best_overlaps_list)
+    n_rotation = sum(1 for o in best_overlaps_list if o < 0.5)
+
+    return {
+        "mode_continuity_min": continuity_min,
+        "mode_continuity_mean": continuity_mean,
+        "n_mode_rotation_events": n_rotation,
+        "n_neg_current": n_neg_current,
+        "n_neg_previous": n_neg_prev,
+    }
+
+
+# ---------------------------------------------------------------------------
+# v12: ModeTracker. Tracks identity of negative Hessian modes across steps
+# ---------------------------------------------------------------------------
+
+class ModeTracker:
+    """Track identity of negative Hessian modes across optimization steps.
+
+    Each tracked mode carries:
+    - eigvec: current eigenvector (updated each step via matching)
+    - eigenvalue: current eigenvalue
+    - age: consecutive steps this mode has been negative
+    - blind_age: consecutive steps with |g · v| / |g| < overlap_thresh
+    - grad_overlap: current |g · v| / |g|
+    """
+
+    def __init__(self, match_threshold: float = 0.5):
+        self.match_threshold = match_threshold
+        self.tracked_modes: List[Dict[str, Any]] = []
+
+    def update(
+        self,
+        evals_vib: torch.Tensor,
+        evecs_vib_3N: torch.Tensor,
+        grad_flat: torch.Tensor,
+        overlap_thresh: float = 0.1,
+    ) -> None:
+        """Call each step. Matches current negative modes to tracked ones."""
+        neg_mask = evals_vib < 0.0
+        n_neg = int(neg_mask.sum().item())
+
+        work_dtype = evecs_vib_3N.dtype
+        grad_w = grad_flat.to(dtype=work_dtype)
+        grad_norm = float(grad_w.norm().item())
+        if grad_norm < 1e-30:
+            grad_norm = 1e-30
+
+        if n_neg == 0:
+            self.tracked_modes = []  # all modes positive, nothing to track
+            return
+
+        neg_evals = evals_vib[neg_mask]
+        neg_evecs = evecs_vib_3N[:, neg_mask]  # (3N, n_neg)
+
+        # Sort by eigenvalue ascending (most negative first)
+        sort_idx = torch.argsort(neg_evals)
+        neg_evals = neg_evals[sort_idx]
+        neg_evecs = neg_evecs[:, sort_idx]
+
+        # Compute grad overlaps for current modes
+        grad_projs = neg_evecs.T @ grad_w  # (n_neg,)
+        cur_overlaps = (grad_projs.abs() / grad_norm).tolist()
+
+        if len(self.tracked_modes) == 0:
+            # first encounter, seed the tracker
+            for i in range(n_neg):
+                g_ov = cur_overlaps[i]
+                self.tracked_modes.append({
+                    "eigvec": neg_evecs[:, i].clone(),
+                    "eigenvalue": float(neg_evals[i].item()),
+                    "age": 1,
+                    "blind_age": 1 if g_ov < overlap_thresh else 0,
+                    "grad_overlap": g_ov,
+                })
+            return
+
+        # Greedy matching: for each tracked mode, find best current mode
+        n_cur = n_neg
+        n_tracked = len(self.tracked_modes)
+        matched_cur = set()
+        matched_tracked = set()
+
+        # Build overlap matrix: tracked_evecs^T @ cur_evecs -> (n_tracked, n_cur)
+        tracked_evecs = torch.stack(
+            [m["eigvec"] for m in self.tracked_modes], dim=1
+        ).to(dtype=work_dtype)  # (3N, n_tracked)
+        overlap_mat = torch.abs(tracked_evecs.T @ neg_evecs)  # (n_tracked, n_cur)
+
+        # Greedy: pick highest overlap pair, assign, repeat
+        for _ in range(min(n_tracked, n_cur)):
+            # Mask already-matched
+            mask = overlap_mat.clone()
+            for ti in matched_tracked:
+                mask[ti, :] = -1.0
+            for ci in matched_cur:
+                mask[:, ci] = -1.0
+
+            best_val = float(mask.max().item())
+            if best_val < self.match_threshold:
+                break
+
+            best_idx = int(mask.argmax().item())
+            ti = best_idx // n_cur
+            ci = best_idx % n_cur
+            matched_tracked.add(ti)
+            matched_cur.add(ci)
+
+            # Update tracked mode
+            g_ov = cur_overlaps[ci]
+            self.tracked_modes[ti]["eigvec"] = neg_evecs[:, ci].clone()
+            self.tracked_modes[ti]["eigenvalue"] = float(neg_evals[ci].item())
+            self.tracked_modes[ti]["age"] += 1
+            self.tracked_modes[ti]["grad_overlap"] = g_ov
+            if g_ov < overlap_thresh:
+                self.tracked_modes[ti]["blind_age"] += 1
+            else:
+                self.tracked_modes[ti]["blind_age"] = 0
+
+        # Unmatched current modes: add as new
+        for ci in range(n_cur):
+            if ci not in matched_cur:
+                g_ov = cur_overlaps[ci]
+                self.tracked_modes.append({
+                    "eigvec": neg_evecs[:, ci].clone(),
+                    "eigenvalue": float(neg_evals[ci].item()),
+                    "age": 1,
+                    "blind_age": 1 if g_ov < overlap_thresh else 0,
+                    "grad_overlap": g_ov,
+                })
+
+        # Remove unmatched tracked modes (they went positive)
+        self.tracked_modes = [
+            m for i, m in enumerate(self.tracked_modes)
+            if i in matched_tracked or i >= n_tracked  # keep newly added
+        ]
+
+    def longest_stuck(self) -> Optional[Dict[str, Any]]:
+        """Mode with highest age (longest continuously negative)."""
+        if not self.tracked_modes:
+            return None
+        return max(self.tracked_modes, key=lambda m: m["age"])
+
+    def second_longest_stuck(self) -> Optional[Dict[str, Any]]:
+        """Mode with second-highest age. Falls back to longest if only one."""
+        if not self.tracked_modes:
+            return None
+        if len(self.tracked_modes) == 1:
+            return self.tracked_modes[0]
+        sorted_modes = sorted(self.tracked_modes, key=lambda m: m["age"], reverse=True)
+        return sorted_modes[1]
+
+    def longest_blind(self, overlap_thresh: float = 0.1) -> Optional[Dict[str, Any]]:
+        """Mode with highest blind_age (longest with low grad overlap)."""
+        blind = [m for m in self.tracked_modes if m["blind_age"] > 0]
+        if not blind:
+            return None
+        return max(blind, key=lambda m: m["blind_age"])
+
+    def second_longest_blind(self, overlap_thresh: float = 0.1) -> Optional[Dict[str, Any]]:
+        """Mode with second-highest blind_age. Falls back to longest if only one."""
+        blind = [m for m in self.tracked_modes if m["blind_age"] > 0]
+        if not blind:
+            return None
+        if len(blind) == 1:
+            return blind[0]
+        sorted_blind = sorted(blind, key=lambda m: m["blind_age"], reverse=True)
+        return sorted_blind[1]
+
+    def summary(self) -> Dict[str, Any]:
+        """Return a JSON-serializable summary for logging."""
+        longest = self.longest_stuck()
+        longest_b = self.longest_blind()
+        return {
+            "n_tracked": len(self.tracked_modes),
+            "longest_stuck_age": longest["age"] if longest else 0,
+            "longest_stuck_eval": longest["eigenvalue"] if longest else float("nan"),
+            "longest_blind_age": longest_b["blind_age"] if longest_b else 0,
+            "longest_blind_eval": longest_b["eigenvalue"] if longest_b else float("nan"),
+            "longest_blind_overlap": longest_b["grad_overlap"] if longest_b else float("nan"),
+        }
+
+
+# ---------------------------------------------------------------------------
+# v4: Blind-mode correction (gradient-independent perturbation)
+# ---------------------------------------------------------------------------
+
+def _blind_mode_correction(
+    delta_x: torch.Tensor,
+    grad: torch.Tensor,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    blind_threshold: float,
+    correction_alpha: float,
+    step_number: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Add fixed-magnitude perturbation along blind negative modes.
+
+    A negative mode is "blind" when |g . v_i| / |g| < blind_threshold,
+    meaning the NR step has essentially zero component along that mode.
+
+    For each blind mode, adds correction_alpha * v_i with alternating sign
+    (even steps: +, odd steps: -) to delta_x BEFORE trust-region capping.
+
+    Combined with a separate neg-mode trust radius (Feature 1), this
+    correction survives the pos-mode trust radius collapse and provides
+    gradient-independent exploration of the negative-eigenvalue subspace.
+
+    Returns:
+        corrected_delta_x: delta_x with blind corrections added
+        info: diagnostic dict with list of corrected modes
+    """
+    neg_mask = evals_vib < 0.0
+    n_neg = int(neg_mask.sum().item())
+    if n_neg == 0:
+        return delta_x, {"n_blind_corrections": 0, "blind_modes": []}
+
+    work_dtype = evecs_vib_3N.dtype
+    grad_w = grad.to(dtype=work_dtype)
+    grad_norm = float(grad_w.norm().item())
+    if grad_norm < 1e-30:
+        grad_norm = 1e-30
+
+    neg_evecs = evecs_vib_3N[:, neg_mask]
+    neg_evals = evals_vib[neg_mask]
+
+    # Sort by eigenvalue ascending (most negative first)
+    sort_idx = torch.argsort(neg_evals)
+    neg_evecs = neg_evecs[:, sort_idx]
+    neg_evals = neg_evals[sort_idx]
+
+    grad_projs = neg_evecs.T @ grad_w
+    overlaps = grad_projs.abs() / grad_norm
+
+    correction = torch.zeros(evecs_vib_3N.shape[0], dtype=work_dtype, device=evecs_vib_3N.device)
+    blind_modes: List[Dict[str, Any]] = []
+
+    for i in range(neg_evecs.shape[1]):
+        overlap_i = float(overlaps[i].item())
+        if overlap_i < blind_threshold:
+            # Alternating sign: even steps +, odd steps -
+            sign = 1.0 if (step_number % 2 == 0) else -1.0
+            correction = correction + sign * neg_evecs[:, i]
+            blind_modes.append({
+                "eval": float(neg_evals[i].item()),
+                "overlap": overlap_i,
+                "sign": sign,
+            })
+
+    if blind_modes:
+        # Normalize correction to max atom displacement = correction_alpha
+        corr_3d = correction.reshape(-1, 3)
+        max_disp = float(corr_3d.norm(dim=1).max().item())
+        if max_disp > 1e-10:
+            correction = correction * (correction_alpha / max_disp)
+
+        delta_x = delta_x + correction.to(dtype=delta_x.dtype)
+
+    return delta_x, {
+        "n_blind_corrections": len(blind_modes),
+        "blind_modes": blind_modes,
+    }
+
+
+# ---------------------------------------------------------------------------
+# NR step builders
+# ---------------------------------------------------------------------------
+
+def _nr_step_hard_filter(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+    nr_threshold: float,
+    forces: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Hard-filter NR step: exclude |λ| < nr_threshold from pseudoinverse.
+
+    Returns (delta_x, V_used, lam_used) where V_used/lam_used are the filtered
+    subsets used to compute the quadratic model for the trust-region ratio.
+    """
+    step_mask = torch.abs(lam_all) >= nr_threshold
+    V = V_all[:, step_mask]
+    lam = lam_all[step_mask]
+    if V.shape[1] > 0:
+        coeffs = V.T @ grad
+        nr_step = V @ (coeffs / torch.abs(lam))
+        delta_x = -nr_step
+    else:
+        delta_x = forces.reshape(-1) * 0.001
+    return delta_x, V, lam
+
+
+def _nr_step_lm_damping(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+    lm_mu: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Levenberg-Marquardt damped NR step.
+
+    step_i = (g·v_i) * |λ_i| / (λ_i² + μ²)
+
+    Regimes:
+      |λ| >> μ  →  1/|λ|   (pure Newton)
+      |λ| =  μ  →  1/(2μ)  (bounded transition)
+      |λ| << μ  →  |λ|/μ²  (flat modes → zero contribution)
+
+    All modes contribute; no hard cutoff. The step magnitude along flat modes
+    vanishes smoothly as μ → ∞.
+    """
+    mu2 = lm_mu ** 2
+    abs_lam = torch.abs(lam_all)
+    # LM weight: |λ| / (λ² + μ²)
+    lm_weights = abs_lam / (lam_all ** 2 + mu2)
+    coeffs = V_all.T @ grad
+    nr_step = V_all @ (coeffs * lm_weights)
+    delta_x = -nr_step
+    return delta_x, V_all, lam_all
+
+
+def _nr_step_shifted_newton(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+    shift_epsilon: float,
+    max_nr_weight: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shifted Newton step (Levenberg shift).
+
+    step_i = (g·v_i) / (λ_i + σ)
+    where σ = max(0, -λ_min) + shift_epsilon
+
+    This makes all effective eigenvalues (λ_i + σ) positive. Crucially,
+    negative modes get LARGER weights than equally-sized positive modes:
+      λ=-0.01, σ=0.011 → weight = 1/0.001 = 1000
+      λ=+0.01, σ=0.011 → weight = 1/0.021 ≈ 48
+    So the step is more aggressive along the problematic directions.
+
+    As σ→0 near a true minimum, this recovers the pure Newton step.
+
+    Safety: shifted_lam is clamped to ≥ shift_epsilon so that when lam_min ≈ 0
+    (near a flat/converged geometry) the shift σ ≈ shift_epsilon does not make
+    near-zero modes explode.  Without this, a mode with λ ≈ 0 gets
+    weight 1/shift_epsilon which is 1e4 for ε=1e-4, blowing up the step.
+    """
+    lam_min = float(lam_all.min().item())
+    sigma = max(0.0, -lam_min) + shift_epsilon
+    shifted_lam = lam_all + sigma  # nominally all positive
+    # Clamp: no shifted eigenvalue may be smaller than shift_epsilon.
+    # This caps the maximum weight at 1/shift_epsilon and prevents explosive
+    # steps when near-zero modes remain after the shift is applied.
+    shifted_lam = torch.clamp(shifted_lam, min=shift_epsilon)
+    if max_nr_weight > 0.0:
+        shifted_lam = torch.clamp(shifted_lam, min=1.0 / max_nr_weight)
+    coeffs = V_all.T @ grad
+    nr_step = V_all @ (coeffs / shifted_lam)
+    delta_x = -nr_step
+    return delta_x, V_all, lam_all
+
+
+# ---------------------------------------------------------------------------
+# v10: Full-spectrum ARC (Adaptive Regularization with Cubics)
+# ---------------------------------------------------------------------------
+
+
+def _solve_arc_secular_full(
+    evals: torch.Tensor,
+    g_proj: torch.Tensor,
+    sigma: float,
+    max_iter: int = 50,
+    tol: float = 1e-10,
+) -> Tuple[float, int]:
+    """Solve the ARC secular equation for the full vibrational spectrum.
+
+    Finds λ* > max(0, -λ_min) such that σ·||s(λ*)|| = λ*,
+    where  s_i(λ) = -g_i / (λ_i + λ).
+
+    This is a scalar root-finding problem solved via safeguarded Newton.
+
+    Returns (lambda_star, n_iterations).
+    """
+    lam_min = float(evals.min().item())
+    boundary = max(0.0, -lam_min)
+
+    # Initial guess: safely above the boundary
+    lambda_k = boundary + 0.1 * sigma + 1e-6
+
+    g2 = g_proj ** 2  # cache squared gradient projections
+
+    n_iter = 0
+    for n_iter in range(1, max_iter + 1):
+        shifted = evals + lambda_k
+        shifted_safe = torch.clamp(shifted.abs(), min=1e-15)
+
+        s_norm_sq = float((g2 / (shifted_safe ** 2)).sum().item())
+        s_norm = s_norm_sq ** 0.5
+
+        if s_norm < 1e-30:
+            break
+
+        # φ(λ) = σ·||s(λ)|| − λ
+        phi = sigma * s_norm - lambda_k
+
+        if abs(phi) < tol * max(lambda_k, 1.0):
+            break
+
+        # φ'(λ) = −σ · Σ g_i² / (λ_i+λ)³  /  ||s(λ)||  − 1
+        dphi = -sigma * float((g2 / (shifted_safe ** 3)).sum().item()) / s_norm - 1.0
+
+        if abs(dphi) < 1e-30:
+            break
+
+        delta = phi / dphi
+        lambda_new = lambda_k - delta
+        # Stay above boundary
+        lambda_k = max(lambda_new, boundary + 1e-8)
+
+    return lambda_k, n_iter
+
+
+def _nr_step_arc(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+    sigma: float,
+    max_atom_disp: float = 1.3,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Full-spectrum ARC step builder.
+
+    Minimizes the cubic model:
+        m(s) = g^T s + ½ s^T H s + (σ/3) ||s||³
+
+    The optimality condition gives the shifted Newton system:
+        (H + λ*·I) s* = −g,   where λ* = σ · ||s*||
+
+    Uses the vibrational eigendecomposition to solve in spectral form,
+    then finds λ* via the scalar secular equation.
+
+    Returns (delta_x, V_all, lam_all, arc_info).
+    """
+    coeffs = V_all.T @ grad  # g·v_i projections
+
+    lambda_star, secular_iters = _solve_arc_secular_full(
+        lam_all, coeffs, sigma
+    )
+
+    # Build the step in eigenbasis
+    shifted_lam = lam_all + lambda_star
+    shifted_lam = torch.clamp(shifted_lam, min=1e-15)
+    step_coeffs = -coeffs / shifted_lam
+    delta_x = V_all @ step_coeffs
+
+    step_norm = float(delta_x.norm().item())
+
+    # Compute effective weights for diagnostics
+    eff_max_weight = float((1.0 / shifted_lam).max().item())
+    eff_min_weight = float((1.0 / shifted_lam).min().item())
+
+    arc_info: Dict[str, Any] = {
+        "lambda_star": lambda_star,
+        "secular_iterations": secular_iters,
+        "step_norm": step_norm,
+        "sigma": sigma,
+        "effective_max_weight": eff_max_weight,
+        "effective_min_weight": eff_min_weight,
+    }
+
+    return delta_x, V_all, lam_all, arc_info
+
+
+def _solve_rfo_secular(
+    evals: torch.Tensor,
+    g_proj: torch.Tensor,
+    max_iter: int = 50,
+    tol: float = 1e-12,
+) -> Tuple[float, int]:
+    """Solve the RFO secular equation for the lowest eigenvalue of the
+    augmented Hessian (Schlegel 2011, Eq. 20).
+
+    Finds μ < λ_min such that:  Σ c_i² / (λ_i - μ) + μ = 0
+
+    where c_i = g · v_i.  The function f(μ) = Σ c_i²/(λ_i - μ) + μ is
+    monotonically increasing with a unique root below λ_min.
+    """
+    c2 = g_proj ** 2
+    lam_min = float(evals.min().item())
+
+    # Initial guess: start well below λ_min
+    g_norm_sq = float(c2.sum().item())
+    if g_norm_sq < 1e-30:
+        # Zero gradient: μ = 0 (pure Newton)
+        return 0.0, 0
+
+    mu = lam_min - (g_norm_sq ** 0.5) - 0.1
+
+    for n_iter in range(1, max_iter + 1):
+        denom = evals - mu
+        denom_safe = torch.where(denom.abs() < 1e-15, torch.ones_like(denom) * 1e-15, denom)
+
+        f_val = float((c2 / denom_safe).sum().item()) + mu
+        f_deriv = float((c2 / (denom_safe ** 2)).sum().item()) + 1.0
+
+        if abs(f_val) < tol * max(abs(mu), 1.0):
+            break
+
+        if abs(f_deriv) < 1e-30:
+            break
+
+        delta = f_val / f_deriv
+        mu_new = mu - delta
+
+        # Safeguard: stay below λ_min
+        mu = min(mu_new, lam_min - 1e-8)
+
+    return mu, n_iter
+
+
+def _nr_step_rfo(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """RFO (Rational Function Optimization) step builder.
+
+    Uses the augmented Hessian eigenvalue problem (Schlegel 2011, Eq. 20):
+        [H  g][s]       [s]
+        [gᵀ 0][1] = μ  [1]
+
+    The lowest eigenvalue μ gives an adaptive shift that automatically
+    interpolates between steepest descent (large gradient → large shift)
+    and Newton (small gradient → small shift). No hyperparameters needed.
+
+    For minimization, μ < λ_min, so all (λ_i - μ) > 0 and the step
+    is guaranteed downhill.
+    """
+    coeffs = V_all.T @ grad
+    mu_rfo, secular_iters = _solve_rfo_secular(lam_all, coeffs)
+
+    shifted = lam_all - mu_rfo
+    shifted = torch.clamp(shifted, min=1e-15)
+    step_coeffs = -coeffs / shifted
+    delta_x = V_all @ step_coeffs
+
+    step_norm = float(delta_x.norm().item())
+    eff_max_weight = float((1.0 / shifted).max().item())
+    eff_min_weight = float((1.0 / shifted).min().item())
+
+    rfo_info: Dict[str, Any] = {
+        "mu_rfo": mu_rfo,
+        "secular_iterations": secular_iters,
+        "step_norm": step_norm,
+        "effective_max_weight": eff_max_weight,
+        "effective_min_weight": eff_min_weight,
+    }
+
+    return delta_x, V_all, lam_all, rfo_info
+
+
+def _detect_oscillation(
+    trajectory: list,
+    window: int = 8,
+    min_sign_change_frac: float = 0.5,
+) -> bool:
+    """Detect energy oscillation in recent trajectory.
+
+    Returns True if energy is oscillating (frequent sign changes in ΔE)
+    without making net progress.
+    """
+    if len(trajectory) < window:
+        return False
+
+    recent = trajectory[-window:]
+    energies = [t["energy"] for t in recent]
+
+    # Net progress: is total energy change small relative to oscillation amplitude?
+    total_change = abs(energies[-1] - energies[0])
+    max_e = max(energies)
+    min_e = min(energies)
+    amplitude = max_e - min_e
+
+    if amplitude < 1e-10:
+        return False  # Flat, not oscillating
+
+    # If net progress is large relative to amplitude, not oscillating
+    if total_change > 0.5 * amplitude:
+        return False
+
+    # Count sign changes in energy differences
+    diffs = [energies[i + 1] - energies[i] for i in range(len(energies) - 1)]
+    sign_changes = sum(
+        1 for i in range(len(diffs) - 1) if diffs[i] * diffs[i + 1] < 0
+    )
+
+    return sign_changes >= (window - 2) * min_sign_change_frac
+
+
+def _nr_step_spectral_partitioned(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+    tau_hard: float = 0.01,
+    tau_soft: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Spectrally-partitioned Newton step (SPDN step builder).
+
+    Eigenvalues are partitioned into three reliability regimes:
+      Hard:  |λ| > tau_hard   → weight = 1/|λ| (full Newton)
+      Soft:  tau_soft < |λ| ≤ tau_hard → weight = 1/tau_hard (capped)
+      Null:  |λ| ≤ tau_soft   → weight = 1/tau_hard (ghost modes, bounded)
+
+    Maximum amplification is bounded at 1/tau_hard (default 100×),
+    preventing the explosive step sizes (2000×) that cause trust-radius
+    collapse in shifted Newton where σ → ε for the most negative mode.
+
+    All modes contribute (none excluded), ensuring the step captures the
+    full gradient. For well-conditioned modes (|λ| > tau_hard), the step
+    is identical to the pure Newton step.
+
+    Returns:
+        delta_x: the step direction (3N,)
+        V_all: all eigenvectors (for backward compat)
+        lam_all: all eigenvalues (for backward compat)
+        info: diagnostic dict with partition counts and weights
+    """
+    abs_lam = torch.abs(lam_all)
+    # Clamp: effective eigenvalue is at least tau_hard → max weight = 1/tau_hard
+    effective_lam = torch.clamp(abs_lam, min=tau_hard)
+    weights = 1.0 / effective_lam
+
+    coeffs = V_all.T @ grad
+    nr_step = V_all @ (coeffs * weights)
+    delta_x = -nr_step
+
+    # Diagnostics
+    hard_pos_mask = lam_all > tau_hard
+    hard_neg_mask = lam_all < -tau_hard
+    soft_mask = (abs_lam > tau_soft) & (abs_lam <= tau_hard)
+    null_mask = abs_lam <= tau_soft
+
+    info: Dict[str, Any] = {
+        "n_hard_pos": int(hard_pos_mask.sum().item()),
+        "n_hard_neg": int(hard_neg_mask.sum().item()),
+        "n_soft": int(soft_mask.sum().item()),
+        "n_null": int(null_mask.sum().item()),
+        "max_weight": float(weights.max().item()),
+        "min_weight": float(weights.min().item()),
+        "cond_effective": float(
+            weights.max().item() / max(weights.min().item(), 1e-30)
+        ),
+    }
+
+    return delta_x, V_all, lam_all, info
+
+
+# ---------------------------------------------------------------------------
+# v8: iHiSD-inspired crossover (gradient descent ↔ Newton)
+# ---------------------------------------------------------------------------
+
+def _compute_crossover_alpha(
+    n_neg: int,
+    force_norm: float,
+    n_neg_ref: float = 3.0,
+    force_ref: float = 0.1,
+) -> float:
+    """Adaptive crossover parameter α ∈ [0, 1].
+
+    α = 0 (far from minimum): full damping → gradient-descent-like step
+    α = 1 (at minimum): no damping → pure shifted Newton
+
+    α = morse_factor × force_factor
+      morse_factor = max(0, 1 - n_neg / n_neg_ref)   → 1 when n_neg=0, 0 when n_neg ≥ ref
+      force_factor = 1 / (1 + force_norm / force_ref) → 1 when small, decays for large
+    """
+    morse_factor = max(0.0, 1.0 - n_neg / n_neg_ref)
+    force_factor = 1.0 / (1.0 + force_norm / force_ref)
+    return morse_factor * force_factor
+
+
+def _nr_step_crossover(
+    grad: torch.Tensor,
+    V_all: torch.Tensor,
+    lam_all: torch.Tensor,
+    shift_epsilon: float,
+    mu_max: float,
+    alpha: float,
+    max_nr_weight: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    """Crossover step: shifted Newton with adaptive additive damping.
+
+    effective_lam_i = shifted_lam_i + mu
+    where mu = mu_max × (1 - alpha)
+
+    When alpha=0: mu=mu_max → all modes get weight ≈ 1/mu_max (gradient descent)
+    When alpha=1: mu=0 → pure shifted Newton (curvature-scaled)
+    """
+    lam_min = float(lam_all.min().item())
+    sigma = max(0.0, -lam_min) + shift_epsilon
+    shifted_lam = lam_all + sigma
+    shifted_lam = torch.clamp(shifted_lam, min=shift_epsilon)
+    if max_nr_weight > 0.0:
+        shifted_lam = torch.clamp(shifted_lam, min=1.0 / max_nr_weight)
+
+    # Additive crossover damping
+    mu = mu_max * (1.0 - alpha)
+    effective_lam = shifted_lam + mu
+
+    coeffs = V_all.T @ grad
+    weights = 1.0 / effective_lam
+    nr_step = V_all @ (coeffs * weights)
+    delta_x = -nr_step
+
+    info = {
+        "alpha": alpha,
+        "mu": mu,
+        "mu_max": mu_max,
+        "sigma": sigma,
+        "weight_max": float(weights.max().item()),
+        "weight_min": float(weights.min().item()),
+        "weight_mean": float(weights.mean().item()),
+        "cond_effective": float(
+            weights.max().item() / max(weights.min().item(), 1e-30)
+        ),
+    }
+
+    return delta_x, V_all, lam_all, info
+
+
+# ---------------------------------------------------------------------------
+# v5: GDIIS (Geometry Direct Inversion of the Iterative Subspace)
+# ---------------------------------------------------------------------------
+
+class _GDIISExtrapolator:
+    """Geometry DIIS (GDIIS) for accelerating geometry optimization.
+
+    Stores recent (geometry, gradient, Newton-step) triples and computes
+    an extrapolated geometry that minimizes the predicted Newton correction.
+
+    True GDIIS (Schlegel 2011, Eq. 16; Csaszar & Pulay 1984) uses the
+    Newton step residuals H⁻¹g as error vectors, NOT raw gradients:
+
+        min ||Σ cᵢ eᵢ||²   subject to Σ cᵢ = 1
+        where eᵢ = H⁻¹gᵢ  (the Newton step at geometry xᵢ)
+
+    This leads to the linear system:
+        [B  1] [c]   [0]
+        [1  0] [λ] = [1]
+    where Bᵢⱼ = eᵢ · eⱼ = (H⁻¹gᵢ)ᵀ(H⁻¹gⱼ).
+
+    Using Newton steps instead of raw gradients accounts for the
+    curvature of the PES and produces better interpolations.
+    """
+
+    def __init__(self, max_size: int = 8, min_size: int = 3):
+        self.max_size = max_size
+        self.min_size = min_size
+        self.coords_history: List[torch.Tensor] = []
+        self.grad_history: List[torch.Tensor] = []
+        self.step_history: List[torch.Tensor] = []
+
+    def store(
+        self,
+        coords_flat: torch.Tensor,
+        grad_flat: torch.Tensor,
+        step_flat: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Store a (geometry, gradient, step) triple.
+
+        If step_flat is provided, it is used as the error vector for the
+        B matrix (true GDIIS). Otherwise, falls back to using the gradient
+        (Pulay SCF-DIIS).
+        """
+        self.coords_history.append(coords_flat.detach().clone())
+        self.grad_history.append(grad_flat.detach().clone())
+        self.step_history.append(
+            step_flat.detach().clone() if step_flat is not None
+            else grad_flat.detach().clone()
+        )
+        if len(self.coords_history) > self.max_size:
+            self.coords_history.pop(0)
+            self.grad_history.pop(0)
+            self.step_history.pop(0)
+
+    @property
+    def n_stored(self) -> int:
+        return len(self.coords_history)
+
+    def can_extrapolate(self) -> bool:
+        return self.n_stored >= self.min_size
+
+    def extrapolate(self) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Attempt GDIIS extrapolation.
+
+        Returns:
+            (extrapolated_coords_flat, info_dict)
+            extrapolated_coords_flat is None if GDIIS failed.
+        """
+        n = self.n_stored
+        if n < self.min_size:
+            return None, {"status": "insufficient_data", "n_stored": n}
+
+        device = self.step_history[0].device
+        dtype = self.step_history[0].dtype
+
+        # Build error matrix Bᵢⱼ = eᵢ · eⱼ using Newton step residuals
+        # (true GDIIS, Schlegel 2011 Eq. 16)
+        B = torch.zeros(n, n, dtype=dtype, device=device)
+        for i in range(n):
+            for j in range(i, n):
+                dot = torch.dot(self.step_history[i], self.step_history[j])
+                B[i, j] = dot
+                B[j, i] = dot
+
+        # Augmented system with constraint Σ cᵢ = 1
+        A = torch.zeros(n + 1, n + 1, dtype=dtype, device=device)
+        A[:n, :n] = B
+        A[:n, n] = 1.0
+        A[n, :n] = 1.0
+
+        rhs = torch.zeros(n + 1, dtype=dtype, device=device)
+        rhs[n] = 1.0
+
+        try:
+            solution = torch.linalg.solve(A, rhs)
+            coeffs = solution[:n]
+        except torch.linalg.LinAlgError:
+            return None, {"status": "singular_matrix", "n_stored": n}
+
+        max_coeff = float(coeffs.abs().max().item())
+        if max_coeff > 10.0:
+            return None, {
+                "status": "poor_conditioning",
+                "n_stored": n,
+                "max_coeff": max_coeff,
+            }
+
+        # Extrapolated geometry and residual
+        x_diis = torch.zeros_like(self.coords_history[0])
+        g_diis = torch.zeros_like(self.grad_history[0])
+        for i in range(n):
+            x_diis = x_diis + coeffs[i] * self.coords_history[i]
+            g_diis = g_diis + coeffs[i] * self.grad_history[i]
+
+        residual_diis = float(g_diis.norm().item())
+        residual_current = float(self.grad_history[-1].norm().item())
+
+        # Condition of the B matrix (for diagnostics)
+        try:
+            b_cond = float(torch.linalg.cond(B).item())
+        except (torch.linalg.LinAlgError, RuntimeError):
+            b_cond = float("inf")
+
+        info: Dict[str, Any] = {
+            "status": "success",
+            "n_stored": n,
+            "coefficients": [float(c) for c in coeffs.tolist()],
+            "max_coeff": max_coeff,
+            "residual_diis": residual_diis,
+            "residual_current": residual_current,
+            "residual_ratio": residual_diis / max(residual_current, 1e-30),
+            "B_cond": b_cond,
+        }
+
+        return x_diis, info
+
+    def reset(self) -> None:
+        """Clear all stored data."""
+        self.coords_history.clear()
+        self.grad_history.clear()
+        self.step_history.clear()
+
+
+# ---------------------------------------------------------------------------
+# v3: Stagnation escape via targeted perturbation along negative modes
+# ---------------------------------------------------------------------------
+
+def _stagnation_escape_perturbation(
+    coords: torch.Tensor,
+    grad: torch.Tensor,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    escape_alpha: float,
+) -> torch.Tensor:
+    """Build a targeted perturbation along negative eigenvectors.
+
+    The displacement is:
+        perturbation = alpha * sum_i( sign(g·v_i) * v_i )  for negative modes i
+    normalized so max atom displacement = escape_alpha.
+
+    sign(g·v_i) ensures we move downhill along each negative mode.
+    If the gradient projection is zero, we pick an arbitrary sign (+1).
+
+    Returns new coordinates after the perturbation.
+    """
+    neg_mask = evals_vib < 0.0
+    if not neg_mask.any():
+        return coords
+
+    neg_evecs = evecs_vib_3N[:, neg_mask]  # (3N, n_neg), float64
+    # Cast grad to match eigenvector dtype to avoid float32/float64 mismatch
+    grad_w = grad.to(dtype=neg_evecs.dtype)
+    grad_projs = neg_evecs.T @ grad_w  # (n_neg,)
+
+    # Build perturbation: sum of negative eigenvectors with gradient-aligned signs
+    signs = torch.sign(grad_projs)
+    signs[signs == 0] = 1.0  # arbitrary positive if exactly zero overlap
+    perturbation = neg_evecs @ signs  # (3N,), float64
+
+    # Normalize to max atom displacement = escape_alpha, cast back to coords dtype
+    pert_3d = perturbation.to(dtype=coords.dtype).reshape(-1, 3)
+    max_disp = float(pert_3d.norm(dim=1).max().item())
+    if max_disp > 1e-10:
+        pert_3d = pert_3d * (escape_alpha / max_disp)
+
+    return coords + pert_3d
+
+
+# ---------------------------------------------------------------------------
+# v3: Negative-mode line search
+# ---------------------------------------------------------------------------
+
+def _neg_mode_line_search(
+    predict_fn,
+    coords: torch.Tensor,
+    atomic_nums: torch.Tensor,
+    atomsymbols: list,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    grad: torch.Tensor,
+    *,
+    purify_hessian: bool = False,
+    alphas: Tuple[float, ...] = (0.02, 0.05, 0.1, 0.15, 0.2, 0.3),
+    min_interatomic_dist: float = 0.5,
+) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+    """Line search along the most negative eigenvector.
+
+    For each alpha in alphas, evaluate the geometry at coords ± alpha * v_neg
+    (sign chosen to move downhill). Pick the trial point whose most-negative
+    eigenvalue is closest to zero (or positive).
+
+    Returns:
+        best_coords: new coordinates, or None if no improvement found.
+        info: dict with line search diagnostics.
+    """
+    neg_mask = evals_vib < 0.0
+    if not neg_mask.any():
+        return None, {"line_search_skipped": True, "reason": "no_neg_modes"}
+
+    # Target the most negative mode
+    sorted_evals, sorted_idx = torch.sort(evals_vib)
+    most_neg_idx = sorted_idx[0]
+    v_neg = evecs_vib_3N[:, most_neg_idx]  # (3N,)
+    lam_neg = float(sorted_evals[0].item())
+
+    # Determine direction: move downhill (cast to match dtypes)
+    grad_w = grad.to(dtype=v_neg.dtype)
+    g_proj = float((grad_w @ v_neg).item())
+    # Cast direction back to coords dtype for displacement arithmetic
+    direction = (v_neg if g_proj > 0 else -v_neg).to(dtype=coords.dtype)
+
+    best_min_eval = lam_neg
+    best_coords = None
+    best_alpha = None
+    trials = []
+
+    for alpha in alphas:
+        disp = direction.reshape(-1, 3) * alpha
+        trial_coords = coords + disp
+        if _min_interatomic_distance(trial_coords) < min_interatomic_dist:
+            continue
+        try:
+            trial_out = predict_fn(trial_coords, atomic_nums, do_hessian=True, require_grad=False)
+            trial_evals, _, _ = get_vib_evals_evecs(
+                trial_out["hessian"], trial_coords, atomsymbols,
+                purify_hessian=purify_hessian,
+            )
+            trial_min_eval = float(trial_evals.min().item())
+            trial_n_neg = int((trial_evals < 0.0).sum().item())
+            trials.append({"alpha": alpha, "min_eval": trial_min_eval, "n_neg": trial_n_neg})
+
+            if trial_min_eval > best_min_eval:
+                best_min_eval = trial_min_eval
+                best_coords = trial_coords
+                best_alpha = alpha
+        except Exception:
+            continue
+
+    info = {
+        "line_search_skipped": False,
+        "original_min_eval": lam_neg,
+        "best_min_eval": best_min_eval,
+        "best_alpha": best_alpha,
+        "n_trials": len(trials),
+        "trials": trials,
+        "improved": best_coords is not None,
+    }
+    return best_coords, info
+
+
+# ---------------------------------------------------------------------------
+# v4: Bidirectional stagnation escape
+# ---------------------------------------------------------------------------
+
+def _stagnation_escape_v4(
+    predict_fn,
+    coords: torch.Tensor,
+    atomic_nums: torch.Tensor,
+    atomsymbols: list,
+    grad: torch.Tensor,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    escape_alpha: float,
+    *,
+    blind_threshold: float = 0.05,
+    purify_hessian: bool = False,
+    min_interatomic_dist: float = 0.5,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Bidirectional stagnation escape along negative eigenvectors (v4).
+
+    Improvements over v3 _stagnation_escape_perturbation():
+      - Most negative mode: bidirectional probe (try +v_0 and -v_0, evaluate
+        Hessian at both, pick direction with less negative eigenvalue). 2 evals.
+      - Other negative modes: sign(g . v_i) if overlap > blind_threshold,
+        else random sign (since gradient gives no information).
+      - Returns new_coords + diagnostic info for conditional acceptance upstream.
+
+    Returns:
+        new_coords: proposed coordinates after escape perturbation.
+        info: diagnostic dict with probe results.
+    """
+    neg_mask = evals_vib < 0.0
+    if not neg_mask.any():
+        return coords, {"escape_skipped": True, "reason": "no_neg_modes"}
+
+    neg_evecs = evecs_vib_3N[:, neg_mask]
+    neg_evals = evals_vib[neg_mask]
+
+    # Sort by eigenvalue ascending (most negative first)
+    sort_idx = torch.argsort(neg_evals)
+    neg_evecs = neg_evecs[:, sort_idx]
+    neg_evals = neg_evals[sort_idx]
+    n_neg = neg_evecs.shape[1]
+
+    grad_w = grad.to(dtype=neg_evecs.dtype)
+    grad_norm = float(grad_w.norm().item())
+    if grad_norm < 1e-30:
+        grad_norm = 1e-30
+    grad_projs = neg_evecs.T @ grad_w
+    overlaps = grad_projs.abs() / grad_norm
+
+    signs = torch.zeros(n_neg, dtype=neg_evecs.dtype, device=neg_evecs.device)
+    info: Dict[str, Any] = {"escape_skipped": False, "bidirectional_probe": False}
+
+    # --- Most negative mode: bidirectional probe ---
+    v_most_neg = neg_evecs[:, 0]
+    disp = v_most_neg.to(dtype=coords.dtype).reshape(-1, 3)
+    disp_norm = float(disp.norm(dim=1).max().item())
+    if disp_norm > 1e-10:
+        disp = disp * (escape_alpha / disp_norm)
+
+    probe_results: Dict[str, float] = {}
+    for direction_sign, label in [(+1.0, "plus"), (-1.0, "minus")]:
+        trial_coords = coords + direction_sign * disp
+        if _min_interatomic_distance(trial_coords) < min_interatomic_dist:
+            probe_results[label] = float("-inf")
+            continue
+        try:
+            trial_out = predict_fn(trial_coords, atomic_nums, do_hessian=True, require_grad=False)
+            trial_evals, _, _ = get_vib_evals_evecs(
+                trial_out["hessian"], trial_coords, atomsymbols,
+                purify_hessian=purify_hessian,
+            )
+            probe_results[label] = float(trial_evals.min().item())
+        except Exception:
+            probe_results[label] = float("-inf")
+
+    # Pick direction that makes eigenvalue less negative (closer to zero)
+    plus_eval = probe_results.get("plus", float("-inf"))
+    minus_eval = probe_results.get("minus", float("-inf"))
+    signs[0] = 1.0 if plus_eval >= minus_eval else -1.0
+
+    info["bidirectional_probe"] = True
+    info["probe_results"] = {
+        "plus_min_eval": plus_eval,
+        "minus_min_eval": minus_eval,
+        "chosen_sign": float(signs[0].item()),
+        "original_min_eval": float(neg_evals[0].item()),
+    }
+
+    # --- Remaining negative modes ---
+    for i in range(1, n_neg):
+        overlap_i = float(overlaps[i].item())
+        if overlap_i > blind_threshold:
+            signs[i] = torch.sign(grad_projs[i])
+            if signs[i] == 0:
+                signs[i] = 1.0
+        else:
+            # Random sign (gradient gives no information for blind modes)
+            signs[i] = 1.0 if torch.rand(1).item() > 0.5 else -1.0
+
+    perturbation = neg_evecs @ signs
+
+    # Normalize to max atom displacement = escape_alpha
+    pert_3d = perturbation.to(dtype=coords.dtype).reshape(-1, 3)
+    max_disp = float(pert_3d.norm(dim=1).max().item())
+    if max_disp > 1e-10:
+        pert_3d = pert_3d * (escape_alpha / max_disp)
+
+    return coords + pert_3d, info
+
+
+# ---------------------------------------------------------------------------
+# v4: Mode-following for large negative eigenvalues (true saddle points)
+# ---------------------------------------------------------------------------
+
+def _mode_follow_step(
+    predict_fn,
+    coords: torch.Tensor,
+    atomic_nums: torch.Tensor,
+    atomsymbols: list,
+    evals_vib: torch.Tensor,
+    evecs_vib_3N: torch.Tensor,
+    mode_follow_alpha: float,
+    *,
+    purify_hessian: bool = False,
+    min_interatomic_dist: float = 0.5,
+) -> Tuple[Optional[torch.Tensor], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Mode-following: bidirectional probe along most negative eigenvector.
+
+    For large negative eigenvalues (|λ_min| > threshold), the gradient often
+    has zero overlap with the negative mode (geometry is at a higher-order
+    saddle point). Standard NR cannot address this.
+
+    Takes an explicit step along ±v_most_negative at mode_follow_alpha,
+    evaluates both, picks the direction where the eigenvalue improves.
+
+    Returns:
+        best_coords: new coordinates (or None if no improvement).
+        info: diagnostic dict.
+        best_out: predict_fn output at best_coords (reuse to avoid extra eval).
+    """
+    neg_mask = evals_vib < 0.0
+    if not neg_mask.any():
+        return None, {"mode_follow_skipped": True, "reason": "no_neg_modes"}, None
+
+    sorted_evals, sorted_idx = torch.sort(evals_vib)
+    most_neg_idx = sorted_idx[0]
+    v_neg = evecs_vib_3N[:, most_neg_idx]
+    lam_neg = float(sorted_evals[0].item())
+
+    disp = v_neg.to(dtype=coords.dtype).reshape(-1, 3)
+    disp_norm = float(disp.norm(dim=1).max().item())
+    if disp_norm > 1e-10:
+        disp = disp * (mode_follow_alpha / disp_norm)
+
+    best_min_eval = lam_neg
+    best_coords = None
+    best_out = None
+    probes: Dict[str, float] = {}
+
+    for sign, label in [(+1.0, "plus"), (-1.0, "minus")]:
+        trial_coords = coords + sign * disp
+        if _min_interatomic_distance(trial_coords) < min_interatomic_dist:
+            continue
+        try:
+            trial_out = predict_fn(trial_coords, atomic_nums, do_hessian=True, require_grad=False)
+            trial_evals, _, _ = get_vib_evals_evecs(
+                trial_out["hessian"], trial_coords, atomsymbols,
+                purify_hessian=purify_hessian,
+            )
+            trial_min_eval = float(trial_evals.min().item())
+            probes[label] = trial_min_eval
+            if trial_min_eval > best_min_eval:
+                best_min_eval = trial_min_eval
+                best_coords = trial_coords
+                best_out = trial_out
+        except Exception:
+            continue
+
+    info = {
+        "mode_follow_skipped": False,
+        "original_min_eval": lam_neg,
+        "best_min_eval": best_min_eval,
+        "probes": probes,
+        "improved": best_coords is not None,
+    }
+    return best_coords, info, best_out
+
+
+# ---------------------------------------------------------------------------
+# Fixed-step gradient descent
+# ---------------------------------------------------------------------------
+
+def run_fixed_step_gd(
+    predict_fn,
+    coords0: torch.Tensor,
+    atomic_nums: torch.Tensor,
+    atomsymbols: list,
+    *,
+    n_steps: int = 5000,
+    step_size: float = 0.01,
+    max_atom_disp: float = 0.3,
+    force_converged: float = 1e-4,
+    min_interatomic_dist: float = 0.5,
+    project_gradient_and_v: bool = False,
+    purify_hessian: bool = False,
+    log_spectrum_k: int = 10,
+) -> Tuple[Dict[str, Any], list]:
+    """Fixed-step gradient descent to find energy minimum.
+
+    Update rule: x_{k+1} = x_k + alpha * forces(x_k)
+
+    No line search, no adaptive step sizing. Pure fixed-step descent.
+    Convergence: force norm < threshold AND n_neg == 0 (no negative vibrational eigenvalues).
+
+    Args:
+        predict_fn: Energy/force prediction function.
+        coords0: Starting coordinates.
+        atomic_nums: Atomic numbers.
+        atomsymbols: Atom symbols (required for Eckart projection).
+        n_steps: Maximum number of steps.
+        step_size: Fixed step size alpha.
+        max_atom_disp: Maximum per-atom displacement per step.
+        force_converged: Force convergence threshold (eV/A).
+        min_interatomic_dist: Minimum allowed interatomic distance.
+        project_gradient_and_v: If True, Eckart-project the gradient.
+        purify_hessian: If True, enforce translational sum rules on Hessian.
+        log_spectrum_k: Number of bottom eigenvalues to log per step (0 = none).
+
+    Returns:
+        result: Summary dictionary.
+        trajectory: Per-step data.
+    """
+    coords = coords0.detach().clone().to(torch.float32)
+    if coords.dim() == 3 and coords.shape[0] == 1:
+        coords = coords[0]
+    coords = coords.reshape(-1, 3)
+
+    trajectory = []
+
+    for step in range(n_steps):
+        out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+        energy = _to_float(out["energy"])
+        forces = out["forces"]
+        hessian = out["hessian"]
+        if forces.dim() == 3 and forces.shape[0] == 1:
+            forces = forces[0]
+        forces = forces.reshape(-1, 3)
+
+        force_norm = _force_mean(forces)
+
+        # vibrational eigenvalues via reduced basis, no threshold filtering needed
+        evals_vib, _, _ = get_vib_evals_evecs(hessian, coords, atomsymbols,
+                                              purify_hessian=purify_hessian)
+
+        # Cascading evaluation diagnostic
+        cascade = _cascade_n_neg(evals_vib)
+        # n_neg at strict threshold (for convergence check)
+        n_neg = cascade["n_neg_at_0.0"]
+
+        # Spectral gap + total Hessian diagnostics
+        gap_info = _spectral_gap_info(evals_vib)
+        n_neg_total = _total_hessian_n_neg(hessian)
+
+        step_record: Dict[str, Any] = {
+            "step": step,
+            "energy": energy,
+            "force_norm": force_norm,
+            "step_size": step_size,
+            "n_neg_evals": n_neg,
+            "n_neg_total_hessian": n_neg_total,
+            "min_vib_eval": float(evals_vib.min().item()) if evals_vib.numel() > 0 else float("nan"),
+            "min_dist": _min_interatomic_distance(coords),
+            **gap_info,
+            **cascade,
+        }
+        if log_spectrum_k > 0:
+            step_record["bottom_spectrum"] = _bottom_k_spectrum(evals_vib, log_spectrum_k)
+
+        trajectory.append(step_record)
+
+        # Convergence: forces small AND no negative vibrational eigenvalues
+        converged_now = force_norm < force_converged and n_neg == 0
+        if converged_now:
+            return {
+                "converged": True,
+                "converged_step": step,
+                "final_energy": energy,
+                "final_force_norm": force_norm,
+                "final_coords": coords.detach().cpu(),
+                "total_steps": step + 1,
+                "final_n_neg_evals": n_neg,
+                "final_n_neg_total_hessian": n_neg_total,
+                "final_min_vib_eval": float(evals_vib.min().item()) if evals_vib.numel() > 0 else float("nan"),
+                "final_spectral_gap_ratio": gap_info["spectral_gap_ratio"],
+                "final_dominant_neg_mode": gap_info["dominant_neg_mode"],
+                "cascade_at_convergence": cascade,
+                "bottom_spectrum_at_convergence": _bottom_k_spectrum(evals_vib, log_spectrum_k),
+            }, trajectory
+
+        # Optionally project gradient to remove TR components
+        forces_flat = forces.reshape(-1)
+        if project_gradient_and_v:
+            forces_flat = project_vector_to_vibrational_torch(
+                forces_flat, coords, atomsymbols,
+            )
+
+        # Fixed-step update: x_{k+1} = x_k + alpha * forces
+        step_disp = step_size * forces_flat.reshape(-1, 3)
+        step_disp = _cap_displacement(step_disp, max_atom_disp)
+
+        new_coords = coords + step_disp
+        if _min_interatomic_distance(new_coords) < min_interatomic_dist:
+            # Halve displacement until geometry is valid
+            for scale in [0.5, 0.25, 0.1, 0.05]:
+                new_coords = coords + step_disp * scale
+                if _min_interatomic_distance(new_coords) >= min_interatomic_dist:
+                    break
+            else:
+                continue  # skip step entirely if nothing works
+
+        coords = new_coords.detach()
+
+    return {
+        "converged": False,
+        "converged_step": None,
+        "final_energy": trajectory[-1]["energy"] if trajectory else float("nan"),
+        "final_force_norm": trajectory[-1]["force_norm"] if trajectory else float("nan"),
+        "final_coords": coords.detach().cpu(),
+        "total_steps": len(trajectory),
+        "final_n_neg_evals": trajectory[-1]["n_neg_evals"] if trajectory else -1,
+        "final_n_neg_total_hessian": trajectory[-1].get("n_neg_total_hessian", -1) if trajectory else -1,
+        "final_min_vib_eval": trajectory[-1].get("min_vib_eval", float("nan")) if trajectory else float("nan"),
+        "final_spectral_gap_ratio": trajectory[-1].get("spectral_gap_ratio", float("nan")) if trajectory else float("nan"),
+        "final_dominant_neg_mode": trajectory[-1].get("dominant_neg_mode", False) if trajectory else False,
+        "cascade_at_convergence": trajectory[-1] if trajectory else {},
+        "bottom_spectrum_at_convergence": trajectory[-1].get("bottom_spectrum", []) if trajectory else [],
+    }, trajectory
+
+
+# ---------------------------------------------------------------------------
+# Newton-Raphson
+# ---------------------------------------------------------------------------
+
+def run_newton_raphson(
+    predict_fn,
+    coords0: torch.Tensor,
+    atomic_nums: torch.Tensor,
+    atomsymbols: list,
+    *,
+    n_steps: int = 5000,
+    max_atom_disp: float = 0.3,
+    force_converged: float = 1e-4,
+    min_interatomic_dist: float = 0.5,
+    nr_threshold: float = 8e-3,
+    project_gradient_and_v: bool = True,
+    purify_hessian: bool = False,
+    known_ts_coords: Optional[torch.Tensor] = None,
+    known_reactant_coords: Optional[torch.Tensor] = None,
+    known_product_coords: Optional[torch.Tensor] = None,
+    # --- v2 options ---
+    lm_mu: float = 0.0,
+    anneal_force_threshold: float = 0.0,
+    cleanup_nr_threshold: float = 0.0,
+    cleanup_max_steps: int = 50,
+    log_spectrum_k: int = 10,
+    # --- v3 options ---
+    shift_epsilon: float = 0.0,
+    stagnation_window: int = 0,
+    escape_alpha: float = 0.1,
+    lm_mu_anneal_factor: float = 0.0,
+    lm_mu_anneal_n_neg_leq: int = 2,
+    lm_mu_anneal_eval_leq: float = 5e-3,
+    neg_mode_line_search: bool = False,
+    line_search_alphas: Optional[List[float]] = None,
+    trust_radius_floor: float = 0.01,
+    # --- v4 options ---
+    neg_trust_floor: float = 0.0,
+    blind_mode_threshold: float = 0.0,
+    blind_correction_alpha: float = 0.02,
+    aggressive_trust_recovery: bool = False,
+    escape_bidirectional: bool = False,
+    mode_follow_eval_threshold: float = 0.0,
+    mode_follow_alpha: float = 0.15,
+    mode_follow_after_steps: int = 2000,
+    # --- v5 SPDN options ---
+    optimizer_mode: str = "",
+    spdn_tau_hard: float = 0.01,
+    spdn_tau_soft: float = 1e-4,
+    spdn_diis_size: int = 8,
+    spdn_diis_every: int = 5,
+    spdn_momentum: float = 0.0,
+    # --- v7 options ---
+    step_control: str = "trust_region",   # "trust_region" or "line_search"
+    max_nr_weight: float = 0.0,           # 0 = no cap; >0 = cap shifted Newton weight at this value
+    # --- v8 crossover options ---
+    crossover_mu_max: float = 0.0,        # 0 = off; >0 = iHiSD crossover damping strength
+    crossover_n_neg_ref: float = 3.0,     # Morse index reference for alpha computation
+    crossover_force_ref: float = 0.1,     # Force reference for alpha computation (eV/A)
+    # --- v9 relaxed convergence ---
+    relaxed_eval_threshold: float = 0.0,  # 0 = strict only; >0 = accept if min_eval >= -threshold
+    accept_relaxed: bool = False,         # if True, treat RELAXED as converged
+    # --- v10 ARC options ---
+    arc_sigma_init: float = 1.0,          # initial cubic regularization σ
+    arc_sigma_min: float = 1e-4,          # minimum σ (prevents pure Newton)
+    arc_sigma_max: float = 1e4,           # maximum σ (prevents complete stagnation)
+    arc_eta1: float = 0.1,               # ρ threshold for successful step
+    arc_eta2: float = 0.9,               # ρ threshold for very successful step
+    arc_gamma1: float = 2.0,             # σ increase factor on bad step
+    arc_gamma2: float = 0.5,             # σ decrease factor on very good step
+    gdiis_buffer_size: int = 0,           # 0 = off; >0 = GDIIS buffer size
+    gdiis_every: int = 5,                # attempt GDIIS every N steps
+    gdiis_late_force_threshold: float = 0.0,  # 0 = off; >0 = attempt GDIIS when force < threshold
+    # --- v10b Schlegel trust radius fix ---
+    schlegel_trust_update: bool = False,  # True = boundary-check growth + step-anchored shrink
+    # --- v10c polynomial refinement ---
+    polynomial_linesearch: bool = False,  # cubic interpolation on accepted TR steps
+    # --- v12 oscillation kick ---
+    osc_kick: bool = False,
+    osc_kick_scale: float = 0.1,         # fraction of trust_radius_floor
+    osc_kick_patience: int = 3,          # consecutive oscillation detections before kick
+    osc_kick_cooldown: int = 50,         # steps between kicks
+    # --- v12 blind-mode kick ---
+    blind_kick: bool = False,
+    blind_kick_scale: float = 0.5,       # fraction of trust_radius_floor
+    blind_kick_overlap_thresh: float = 0.1,
+    blind_kick_force_thresh: float = 0.1,  # eV/Å
+    blind_kick_patience: int = 100,      # consecutive steps before trigger
+    # --- v12 shared kick options ---
+    kick_eigvec_index: int = 0,          # 0=most negative, 1=second most (ablation)
+    # --- v12b improvements ---
+    adaptive_kick_scale: bool = False,   # scale kick magnitude with |λ_min|^{1/2}
+    adaptive_kick_C: float = 0.1,        # multiplier: kick = C * |λ_min|^{1/2}, clamped to [floor, 10*floor]
+    blind_kick_probe: bool = False,      # line-probe along blind eigvec at increasing magnitudes
+    blind_kick_probe_factors: Optional[List[float]] = None,  # probe distances as multiples of trust_radius_floor
+    late_escape: bool = False,           # aggressive displacement after late_escape_after steps
+    late_escape_after: int = 15000,      # step threshold for late escape
+    late_escape_alpha: float = 0.1,      # displacement magnitude (Å)
+    late_escape_cooldown: int = 500,     # steps between late escapes
+    # --- v14 investigation: force-gated strict convergence ---
+    strict_force_gate: bool = False,     # if True, strict convergence also requires force < force_converged
+) -> Tuple[Dict[str, Any], list]:
+    """Newton-Raphson optimization to find energy minimum.
+
+    Update rule: x_{k+1} = x_k - H(x_k)^{-1} * grad E(x_k)
+
+    The inverse Hessian step is computed via pseudoinverse in the
+    vibrational subspace, using absolute values of eigenvalues to ensure
+    it is always a descent direction.
+
+    Step-building modes (selected at runtime by which parameters are nonzero):
+      1. SPDN (optimizer_mode == "spdn"):
+         Spectrally-Partitioned DIIS-Newton. Uses spectral step builder with
+         bounded weights (max 1/tau_hard), GDIIS extrapolation to break
+         oscillation cycles, and backtracking line search instead of
+         quadratic trust region.
+      2. Shifted Newton (shift_epsilon > 0):
+         step_i = (g·v_i) / (λ_i + σ), σ = max(0, -λ_min) + shift_epsilon.
+         Makes all effective eigenvalues positive. Negative modes get larger
+         weights → more aggressive along problematic directions.
+      3. LM damping (lm_mu > 0, shift_epsilon == 0):
+         step_i = (g·v_i) * |λ_i| / (λ_i² + μ²). No hard cutoff; flat modes
+         contribute a vanishingly small amount.
+      4. Two-phase annealing (anneal_force_threshold > 0, lm_mu == 0):
+         Phase 1: hard filter with nr_threshold. Phase 2: cleanup_nr_threshold.
+      5. Hard filter (default, all above == 0):
+         Exclude |λ| < nr_threshold from pseudoinverse.
+
+    v3 features:
+      - Stagnation escape (stagnation_window > 0): when n_neg is unchanged
+        for stagnation_window consecutive steps, apply targeted perturbation
+        along negative eigenvectors, then optionally a negative-mode line search.
+      - Adaptive LM μ annealing (lm_mu_anneal_factor > 0): when n_neg <= threshold
+        and |λ_min| < threshold, reduce μ by anneal_factor.
+      - Per-step diagnostic logging: gradient-mode overlap, step decomposition.
+      - Trust-region floor: prevents the trust radius from shrinking below
+        trust_radius_floor, ensuring the optimizer can always take meaningful steps.
+
+    v4 features:
+      - Separate neg-mode trust radius (neg_trust_floor > 0): decomposes NR step
+        into pos/neg eigenvalue subspace components, caps each independently.
+      - Blind-mode correction (blind_mode_threshold > 0): fixed-magnitude
+        perturbation along negative modes with low gradient overlap.
+      - Aggressive trust recovery: softer shrink near zero eigenvalues, reset on
+        n_neg decrease, grow on 50-step eigenvalue improvement.
+
+    v5 SPDN features (optimizer_mode == "spdn"):
+      - Spectral partitioning: eigenvalues split into hard (|λ|>tau_hard),
+        soft (tau_soft<|λ|<=tau_hard), null (|λ|<=tau_soft) regimes with
+        bounded weights preventing trust-radius collapse.
+      - GDIIS extrapolation: breaks period-8 oscillation cycles by finding
+        the center of the cycle via constrained least-squares.
+      - Backtracking line search: replaces quadratic trust region with
+        Armijo-condition backtracking, robust to Hessian inaccuracy.
+      - Modified convergence: n_neg_reliable==0 (ignoring ghost eigenvalues
+        below tau_soft) AND force_norm < force_converged.
+      - Momentum (optional): Polyak heavy-ball for oscillation damping.
+      - Bidirectional escape: probes both +/- along most negative mode, conditional
+        acceptance prevents eigenvalue worsening.
+      - Mode-following (mode_follow_eval_threshold > 0): for true saddle points,
+        explicit bidirectional probe along most negative eigenvector.
+    """
+    coords = coords0.detach().clone().to(torch.float32)
+    if coords.dim() == 3 and coords.shape[0] == 1:
+        coords = coords[0]
+    coords = coords.reshape(-1, 3)
+
+    coords0_reshaped = coords.clone()
+
+    if known_ts_coords is not None:
+        known_ts_coords = known_ts_coords.detach().clone().to(torch.float32).to(coords.device)
+        if known_ts_coords.dim() == 3 and known_ts_coords.shape[0] == 1:
+            known_ts_coords = known_ts_coords[0]
+        known_ts_coords = known_ts_coords.reshape(-1, 3)
+
+    if known_reactant_coords is not None:
+        known_reactant_coords = known_reactant_coords.detach().clone().to(torch.float32).to(coords.device)
+        if known_reactant_coords.dim() == 3 and known_reactant_coords.shape[0] == 1:
+            known_reactant_coords = known_reactant_coords[0]
+        known_reactant_coords = known_reactant_coords.reshape(-1, 3)
+
+    if known_product_coords is not None:
+        known_product_coords = known_product_coords.detach().clone().to(torch.float32).to(coords.device)
+        if known_product_coords.dim() == 3 and known_product_coords.shape[0] == 1:
+            known_product_coords = known_product_coords[0]
+        known_product_coords = known_product_coords.reshape(-1, 3)
+
+    # Eigenvector continuity tracking state
+    prev_neg_evecs: Optional[torch.Tensor] = None
+    prev_neg_evals: Optional[torch.Tensor] = None
+
+    # --- Mode selection (priority: ARC > RFO > SPDN > crossover > shifted > LM > anneal > hard filter) ---
+    use_arc = optimizer_mode.lower() == "arc"
+    use_rfo = (not use_arc) and optimizer_mode.lower() == "rfo"
+    use_spdn = (not use_arc) and (not use_rfo) and optimizer_mode.lower() == "spdn"
+    use_crossover = (not use_arc) and (not use_rfo) and (not use_spdn) and crossover_mu_max > 0.0
+    use_line_search = (not use_arc) and (not use_rfo) and (step_control.lower() == "line_search" or use_crossover)
+    use_shifted = (not use_arc) and (not use_rfo) and (not use_spdn) and (not use_crossover) and shift_epsilon > 0.0
+    use_lm = (not use_arc) and (not use_rfo) and (not use_spdn) and (not use_crossover) and (not use_shifted) and lm_mu > 0.0
+    use_anneal = (not use_arc) and (not use_rfo) and (not use_spdn) and (not use_crossover) and (not use_shifted) and (not use_lm) and anneal_force_threshold > 0.0
+    in_cleanup_phase = False
+
+    # Effective LM mu (may be annealed)
+    effective_lm_mu = lm_mu
+
+    # Line search alphas
+    ls_alphas = tuple(line_search_alphas) if line_search_alphas else (0.02, 0.05, 0.1, 0.15, 0.2, 0.3)
+
+    trajectory: list = []
+    current_trust_radius = max_atom_disp
+
+    # Stagnation tracking
+    prev_n_neg = -1
+    stagnation_counter = 0
+    total_escapes = 0
+    total_line_searches = 0
+
+    # v4: split trust radius, mode-follow counters, eigenvalue tracking
+    use_split_trust = neg_trust_floor > 0.0
+    current_neg_trust_radius = max_atom_disp if use_split_trust else current_trust_radius
+    prev_min_vib_eval_for_trust: Optional[float] = None
+    total_mode_follows = 0
+    min_eval_history_50: List[float] = []  # rolling window for aggressive trust recovery
+
+    # v5 SPDN state
+    gdiis: Optional[_GDIISExtrapolator] = None
+    total_diis_attempts = 0
+    total_diis_accepts = 0
+    total_diis_energy_accepts = 0
+    prev_evals_vib_for_spdn: Optional[torch.Tensor] = None
+    prev_coords_flat: Optional[torch.Tensor] = None  # for momentum
+    if use_spdn:
+        gdiis = _GDIISExtrapolator(max_size=spdn_diis_size, min_size=3)
+
+    # v10 ARC state
+    arc_sigma = arc_sigma_init
+    arc_gdiis: Optional[_GDIISExtrapolator] = None
+    arc_gdiis_attempts = 0
+    arc_gdiis_accepts = 0
+    if use_arc and gdiis_buffer_size > 0:
+        arc_gdiis = _GDIISExtrapolator(max_size=gdiis_buffer_size, min_size=3)
+
+    # v12 kick state
+    mode_tracker = ModeTracker(match_threshold=0.5) if (osc_kick or blind_kick or late_escape) else None
+    osc_kick_consec = 0          # consecutive oscillation detections
+    osc_kick_cooldown_counter = 0  # steps since last osc kick
+    blind_kick_cooldown_counter = 0  # steps since last blind kick
+    total_osc_kicks = 0
+    total_blind_kicks = 0
+
+    # v12b state
+    late_escape_cooldown_counter = 0
+    total_late_escapes = 0
+    _probe_factors = blind_kick_probe_factors or [1.0, 2.0, 5.0, 10.0, 20.0]
+
+    # Evaluate initial state
+    out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+
+    step = 0
+    cleanup_steps_taken = 0
+
+    while step < n_steps:
+        energy = _to_float(out["energy"])
+        forces = out["forces"]
+        hessian = out["hessian"]
+
+        if forces.dim() == 3 and forces.shape[0] == 1:
+            forces = forces[0]
+        forces = forces.reshape(-1, 3)
+
+        force_norm = _force_mean(forces)
+
+        # vibrational eigenvalues via reduced basis (exactly 3N-k values, no threshold)
+        evals_vib, evecs_vib_3N, _ = get_vib_evals_evecs(
+            hessian, coords, atomsymbols, purify_hessian=purify_hessian,
+        )
+
+        # Cascading evaluation: n_neg at each threshold (pure diagnostics, no optimization effect)
+        cascade = _cascade_n_neg(evals_vib)
+        n_neg = cascade["n_neg_at_0.0"]  # strict count used for logging
+
+        # Spectral gap + total Hessian diagnostics
+        gap_info = _spectral_gap_info(evals_vib)
+        n_neg_total = _total_hessian_n_neg(hessian)
+
+        # Spectrum statistics for logging
+        min_vib_eval = float(evals_vib.min().item()) if evals_vib.numel() > 0 else float("nan")
+        max_vib_eval = float(evals_vib.max().item()) if evals_vib.numel() > 0 else float("nan")
+
+        if evals_vib.numel() > 0:
+            abs_evals = torch.abs(evals_vib)
+            min_abs_vib = float(abs_evals.min().item())
+            max_abs_vib = float(abs_evals.max().item())
+            cond_num = max_abs_vib / min_abs_vib if min_abs_vib > 0 else float("inf")
+        else:
+            cond_num = float("nan")
+
+        vib_pos = evals_vib[evals_vib > 0]
+        eff_step = float(1.0 / vib_pos.min().item()) if vib_pos.numel() > 0 else float("nan")
+
+        disp_from_start_max = float((coords - coords0_reshaped).norm(dim=1).max().item())
+        disp_from_start_rmsd = float(
+            (coords - coords0_reshaped).norm(dim=1).pow(2).mean().sqrt().item()
+        )
+        dist_to_ts_max = (
+            float((coords - known_ts_coords).norm(dim=1).max().item())
+            if known_ts_coords is not None else None
+        )
+
+        # Distance to reactant
+        if known_reactant_coords is not None:
+            _r_diffs = (coords - known_reactant_coords).norm(dim=1)
+            dist_to_reactant_max = float(_r_diffs.max().item())
+            dist_to_reactant_rmsd = float(_r_diffs.pow(2).mean().sqrt().item())
+        else:
+            dist_to_reactant_max = None
+            dist_to_reactant_rmsd = None
+
+        # Distance to product
+        if known_product_coords is not None:
+            _p_diffs = (coords - known_product_coords).norm(dim=1)
+            dist_to_product_max = float(_p_diffs.max().item())
+            dist_to_product_rmsd = float(_p_diffs.pow(2).mean().sqrt().item())
+        else:
+            dist_to_product_max = None
+            dist_to_product_rmsd = None
+
+        # Eigenvalue band populations
+        band_pops = _eigenvalue_band_populations(evals_vib)
+
+        # Eigenvector continuity
+        evec_cont = _eigenvector_continuity(
+            evals_vib, evecs_vib_3N, prev_neg_evecs, prev_neg_evals,
+        )
+        # Update state for next step
+        neg_mask_for_state = evals_vib < 0.0
+        if neg_mask_for_state.any():
+            prev_neg_evecs = evecs_vib_3N[:, neg_mask_for_state].clone()
+            prev_neg_evals = evals_vib[neg_mask_for_state].clone()
+        else:
+            prev_neg_evecs = None
+            prev_neg_evals = None
+
+        # v12: Update mode tracker (needs grad, computed below for step builder,
+        # but we need a raw version here for overlap computation)
+        if mode_tracker is not None:
+            _grad_for_tracker = -forces.reshape(-1)
+            if project_gradient_and_v:
+                _grad_for_tracker = -project_vector_to_vibrational_torch(
+                    forces.reshape(-1), coords, atomsymbols,
+                )
+            mode_tracker.update(
+                evals_vib, evecs_vib_3N, _grad_for_tracker,
+                overlap_thresh=blind_kick_overlap_thresh,
+            )
+
+        # ---------------------------------------------------------------
+        # Stagnation tracking
+        # ---------------------------------------------------------------
+        if n_neg == prev_n_neg and n_neg > 0:
+            stagnation_counter += 1
+        else:
+            stagnation_counter = 0
+        prev_n_neg = n_neg
+
+        # Energy plateau detection: compare to energy 10 steps ago
+        energy_plateau = False
+        if len(trajectory) >= 10:
+            old_energy = trajectory[-10].get("energy", energy)
+            energy_plateau = abs(energy - old_energy) < 1e-8
+
+        step_record: Dict[str, Any] = {
+            "step": step,
+            "energy": energy,
+            "force_norm": force_norm,
+            "n_neg_evals": n_neg,
+            "n_neg_total_hessian": n_neg_total,
+            "min_vib_eval": min_vib_eval,
+            "max_vib_eval": max_vib_eval,
+            "cond_num": cond_num,
+            "eff_step_size": eff_step,
+            "min_dist": _min_interatomic_distance(coords),
+            "trust_radius": current_trust_radius,
+            "disp_from_start_max": disp_from_start_max,
+            "disp_from_start_rmsd": disp_from_start_rmsd,
+            "dist_to_ts_max": dist_to_ts_max,
+            "dist_to_reactant_max": dist_to_reactant_max,
+            "dist_to_reactant_rmsd": dist_to_reactant_rmsd,
+            "dist_to_product_max": dist_to_product_max,
+            "dist_to_product_rmsd": dist_to_product_rmsd,
+            "phase": "cleanup" if in_cleanup_phase else "bulk",
+            "stagnation_counter": stagnation_counter,
+            "energy_plateau": energy_plateau,
+            "effective_lm_mu": effective_lm_mu if use_lm else None,
+            "neg_trust_radius": current_neg_trust_radius if use_split_trust else None,
+            **gap_info,
+            **cascade,
+            **band_pops,
+        }
+        if log_spectrum_k > 0:
+            step_record["bottom_spectrum"] = _bottom_k_spectrum(evals_vib, log_spectrum_k)
+
+        step_record["eigenvec_continuity"] = evec_cont
+
+        # v12: mode tracker summary
+        if mode_tracker is not None:
+            step_record["mode_tracker"] = mode_tracker.summary()
+
+        # v5 SPDN spectral conditioning diagnostics
+        if use_spdn:
+            spec_cond = _spectral_conditioning_diagnostics(
+                evals_vib, prev_evals_vib_for_spdn, spdn_tau_hard, spdn_tau_soft,
+            )
+            step_record["spectral_conditioning"] = spec_cond
+
+            # Saddle point detection (diagnostic only, not used for optimization)
+            n_neg_reliable = int((evals_vib < -spdn_tau_soft).sum().item())
+            step_record["n_neg_reliable"] = n_neg_reliable
+            step_record["saddle_diagnostic"] = {
+                "is_saddle_like": force_norm < 0.01 and n_neg_reliable > 0,
+                "n_neg_reliable": n_neg_reliable,
+                "force_norm": force_norm,
+            }
+
+            prev_evals_vib_for_spdn = evals_vib.clone()
+
+        trajectory.append(step_record)
+
+        # ---------------------------------------------------------------
+        # Convergence check
+        # ---------------------------------------------------------------
+        # Classify convergence: STRICT (n_neg==0), RELAXED (min_eval >= -threshold), NONE
+        if use_spdn:
+            n_neg_reliable = int((evals_vib < -spdn_tau_soft).sum().item())
+            strict_converged = (n_neg_reliable == 0) and (force_norm < force_converged)
+        else:
+            if strict_force_gate:
+                strict_converged = n_neg == 0 and force_norm < force_converged
+            else:
+                strict_converged = n_neg == 0
+
+        relaxed_converged = False
+        if relaxed_eval_threshold > 0 and not strict_converged:
+            relaxed_converged = (
+                force_norm < force_converged
+                and min_vib_eval >= -relaxed_eval_threshold
+            )
+
+        if strict_converged:
+            convergence_class = "STRICT"
+        elif relaxed_converged:
+            convergence_class = "RELAXED"
+        else:
+            convergence_class = "NONE"
+
+        step_record["convergence_class"] = convergence_class
+
+        converged_now = strict_converged or (accept_relaxed and relaxed_converged)
+        anneal_gate_passed = (not use_anneal) or in_cleanup_phase
+        if converged_now and anneal_gate_passed:
+            result_dict: Dict[str, Any] = {
+                "converged": True,
+                "convergence_class": convergence_class,
+                "converged_step": step,
+                "final_energy": energy,
+                "final_force_norm": force_norm,
+                "final_coords": coords.detach().cpu(),
+                "total_steps": step + 1,
+                "final_n_neg_evals": n_neg,
+                "final_n_neg_total_hessian": n_neg_total,
+                "final_min_vib_eval": min_vib_eval,
+                "final_spectral_gap_ratio": gap_info["spectral_gap_ratio"],
+                "final_dominant_neg_mode": gap_info["dominant_neg_mode"],
+                "cascade_at_convergence": cascade,
+                "bottom_spectrum_at_convergence": _bottom_k_spectrum(evals_vib, log_spectrum_k),
+                "cleanup_steps_taken": cleanup_steps_taken,
+                "total_escapes": total_escapes,
+                "total_line_searches": total_line_searches,
+                "total_mode_follows": total_mode_follows,
+            }
+            if use_spdn:
+                result_dict["total_diis_attempts"] = total_diis_attempts
+                result_dict["total_diis_accepts"] = total_diis_accepts
+                result_dict["total_diis_energy_accepts"] = total_diis_energy_accepts
+                result_dict["optimizer_mode"] = "spdn"
+            if use_arc:
+                result_dict["optimizer_mode"] = "arc"
+                result_dict["final_arc_sigma"] = arc_sigma
+                result_dict["arc_gdiis_attempts"] = arc_gdiis_attempts
+                result_dict["arc_gdiis_accepts"] = arc_gdiis_accepts
+            if use_rfo:
+                result_dict["optimizer_mode"] = "rfo"
+            if osc_kick or blind_kick or late_escape:
+                result_dict["total_osc_kicks"] = total_osc_kicks
+                result_dict["total_blind_kicks"] = total_blind_kicks
+                result_dict["total_late_escapes"] = total_late_escapes
+            return result_dict, trajectory
+
+        # ---------------------------------------------------------------
+        # v5 SPDN: GDIIS extrapolation attempt
+        # ---------------------------------------------------------------
+        if use_spdn and gdiis is not None:
+            # Note: GDIIS storage is deferred to after step-building so we can
+            # store the Newton step vector (true GDIIS, Schlegel 2011 Eq. 16).
+            # Extrapolation uses data from PREVIOUS iterations only.
+
+            # Attempt extrapolation every spdn_diis_every steps
+            if (step > 0
+                    and step % spdn_diis_every == 0
+                    and gdiis.can_extrapolate()):
+                total_diis_attempts += 1
+                diis_coords_flat, diis_info = gdiis.extrapolate()
+                step_record["gdiis_info"] = diis_info
+
+                if diis_coords_flat is not None:
+                    diis_coords = diis_coords_flat.reshape(-1, 3)
+
+                    # Check physical validity
+                    if _min_interatomic_distance(diis_coords) >= min_interatomic_dist:
+                        # Evaluate at DIIS geometry
+                        diis_out = predict_fn(
+                            diis_coords, atomic_nums,
+                            do_hessian=True, require_grad=False,
+                        )
+                        diis_energy = _to_float(diis_out["energy"])
+
+                        # Accept if energy decreased
+                        if diis_energy < energy + 1e-6:
+                            total_diis_accepts += 1
+                            if diis_energy < energy - 1e-8:
+                                total_diis_energy_accepts += 1
+                            coords = diis_coords.detach()
+                            out = diis_out
+                            step_record["gdiis_accepted"] = True
+                            step_record["gdiis_energy_change"] = diis_energy - energy
+                            step += 1
+                            continue
+                        else:
+                            step_record["gdiis_accepted"] = False
+                            step_record["gdiis_energy_change"] = diis_energy - energy
+                    else:
+                        step_record["gdiis_accepted"] = False
+                        step_record["gdiis_reject_reason"] = "min_dist_violation"
+
+        # ---------------------------------------------------------------
+        # v4: Mode-following for large negative eigenvalues (true saddle)
+        # ---------------------------------------------------------------
+        if (mode_follow_eval_threshold > 0.0
+                and step >= mode_follow_after_steps
+                and n_neg > 0
+                and abs(min_vib_eval) > mode_follow_eval_threshold):
+            mf_coords, mf_info, mf_out = _mode_follow_step(
+                predict_fn, coords, atomic_nums, atomsymbols,
+                evals_vib, evecs_vib_3N, mode_follow_alpha,
+                purify_hessian=purify_hessian,
+                min_interatomic_dist=min_interatomic_dist,
+            )
+            step_record["mode_follow_info"] = mf_info
+
+            if mf_coords is not None and mf_out is not None:
+                coords = mf_coords.detach()
+                out = mf_out
+                current_trust_radius = max_atom_disp
+                if use_split_trust:
+                    current_neg_trust_radius = max_atom_disp
+                stagnation_counter = 0
+                total_mode_follows += 1
+                step_record["mode_follow_triggered"] = True
+                step += 1
+                continue
+
+        # ---------------------------------------------------------------
+        # v3/v4: Stagnation escape
+        # ---------------------------------------------------------------
+        if (stagnation_window > 0
+                and stagnation_counter >= stagnation_window
+                and n_neg > 0
+                and abs(min_vib_eval) < 0.02):  # only escape from shallow saddles
+
+            grad_for_escape = -forces.reshape(-1)
+            if project_gradient_and_v:
+                grad_for_escape = -project_vector_to_vibrational_torch(
+                    forces.reshape(-1), coords, atomsymbols,
+                )
+
+            if escape_bidirectional:
+                # v4: bidirectional escape with conditional acceptance
+                esc_coords, esc_info = _stagnation_escape_v4(
+                    predict_fn, coords, atomic_nums, atomsymbols,
+                    grad_for_escape, evals_vib, evecs_vib_3N, escape_alpha,
+                    blind_threshold=blind_mode_threshold if blind_mode_threshold > 0.0 else 0.05,
+                    purify_hessian=purify_hessian,
+                    min_interatomic_dist=min_interatomic_dist,
+                )
+                step_record["escape_info"] = esc_info
+
+                # Conditional acceptance: check eigenvalue at proposed point
+                if _min_interatomic_distance(esc_coords) >= min_interatomic_dist:
+                    check_out = predict_fn(
+                        esc_coords, atomic_nums, do_hessian=True, require_grad=False,
+                    )
+                    check_evals, _, _ = get_vib_evals_evecs(
+                        check_out["hessian"], esc_coords, atomsymbols,
+                        purify_hessian=purify_hessian,
+                    )
+                    check_min_eval = float(check_evals.min().item())
+
+                    # Accept only if max |λ_neg| didn't increase
+                    if check_min_eval >= min_vib_eval - 1e-6:
+                        coords = esc_coords.detach()
+                        out = check_out  # reuse evaluation
+                        current_trust_radius = max_atom_disp
+                        if use_split_trust:
+                            current_neg_trust_radius = max_atom_disp
+                        stagnation_counter = 0
+                        total_escapes += 1
+                        step_record["escape_triggered"] = True
+                        step_record["escape_accepted"] = True
+                    else:
+                        step_record["escape_triggered"] = True
+                        step_record["escape_accepted"] = False
+                        step_record["escape_rejected_reason"] = (
+                            f"min_eval worsened: {min_vib_eval:.6f} -> {check_min_eval:.6f}"
+                        )
+
+                step += 1
+                continue
+            else:
+                # v3: unconditional escape
+                new_coords = _stagnation_escape_perturbation(
+                    coords, grad_for_escape, evals_vib, evecs_vib_3N, escape_alpha,
+                )
+
+                # Phase 2: optional line search along the most negative mode
+                if neg_mode_line_search:
+                    ls_coords, ls_info = _neg_mode_line_search(
+                        predict_fn, coords, atomic_nums, atomsymbols,
+                        evals_vib, evecs_vib_3N, grad_for_escape,
+                        purify_hessian=purify_hessian,
+                        alphas=ls_alphas,
+                        min_interatomic_dist=min_interatomic_dist,
+                    )
+                    step_record["line_search_info"] = ls_info
+                    total_line_searches += 1
+                    if ls_coords is not None:
+                        new_coords = ls_coords
+
+                if _min_interatomic_distance(new_coords) >= min_interatomic_dist:
+                    coords = new_coords.detach()
+                    out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+                    current_trust_radius = max_atom_disp
+                    if use_split_trust:
+                        current_neg_trust_radius = max_atom_disp
+                    stagnation_counter = 0
+                    total_escapes += 1
+                    step_record["escape_triggered"] = True
+                    step += 1
+                    continue
+
+        # ---------------------------------------------------------------
+        # v3: Adaptive LM μ annealing
+        # ---------------------------------------------------------------
+        if (use_lm
+                and lm_mu_anneal_factor > 0.0
+                and n_neg <= lm_mu_anneal_n_neg_leq
+                and n_neg > 0
+                and abs(min_vib_eval) < lm_mu_anneal_eval_leq):
+            effective_lm_mu = lm_mu * lm_mu_anneal_factor
+        elif use_lm:
+            effective_lm_mu = lm_mu
+
+        # ---------------------------------------------------------------
+        # Two-phase annealing: transition to cleanup phase
+        # ---------------------------------------------------------------
+        if use_anneal and not in_cleanup_phase and force_norm < anneal_force_threshold:
+            in_cleanup_phase = True
+
+        # ---------------------------------------------------------------
+        # Determine effective nr_threshold for this step
+        # ---------------------------------------------------------------
+        if in_cleanup_phase:
+            effective_threshold = cleanup_nr_threshold
+        else:
+            effective_threshold = nr_threshold
+
+        # ---------------------------------------------------------------
+        # Build gradient
+        # ---------------------------------------------------------------
+        grad = -forces.reshape(-1)
+        if project_gradient_and_v:
+            grad = -project_vector_to_vibrational_torch(
+                forces.reshape(-1), coords, atomsymbols,
+            )
+
+        work_dtype = grad.dtype
+        V_all = evecs_vib_3N.to(device=grad.device, dtype=work_dtype)
+        lam_all = evals_vib.to(device=grad.device, dtype=work_dtype)
+
+        # ---------------------------------------------------------------
+        # Compute NR step (priority: ARC > SPDN > crossover > shifted > LM > anneal > HF)
+        # ---------------------------------------------------------------
+        if use_arc:
+            delta_x, V, lam, arc_step_info = _nr_step_arc(
+                grad, V_all, lam_all, arc_sigma, max_atom_disp,
+            )
+            step_record["step_mode"] = "arc"
+            step_record["arc_info"] = arc_step_info
+        elif use_rfo:
+            delta_x, V, lam, rfo_info = _nr_step_rfo(grad, V_all, lam_all)
+            step_record["step_mode"] = "rfo"
+            step_record["rfo_info"] = rfo_info
+        elif use_spdn:
+            delta_x, V, lam, spdn_step_info = _nr_step_spectral_partitioned(
+                grad, V_all, lam_all, spdn_tau_hard, spdn_tau_soft,
+            )
+            step_record["step_mode"] = "spdn"
+            step_record["spdn_step_info"] = spdn_step_info
+
+            # Optional momentum (Polyak heavy-ball)
+            if spdn_momentum > 0.0 and prev_coords_flat is not None:
+                momentum_vec = spdn_momentum * (coords.reshape(-1) - prev_coords_flat)
+                delta_x = delta_x + momentum_vec.to(dtype=delta_x.dtype)
+                step_record["spdn_momentum_applied"] = True
+        elif use_crossover:
+            crossover_alpha = _compute_crossover_alpha(
+                n_neg, force_norm, crossover_n_neg_ref, crossover_force_ref,
+            )
+            delta_x, V, lam, crossover_info = _nr_step_crossover(
+                grad, V_all, lam_all, shift_epsilon,
+                crossover_mu_max, crossover_alpha, max_nr_weight,
+            )
+            step_record["step_mode"] = "crossover"
+            step_record["crossover_info"] = crossover_info
+        elif use_shifted:
+            delta_x, V, lam = _nr_step_shifted_newton(grad, V_all, lam_all, shift_epsilon, max_nr_weight)
+            step_record["step_mode"] = "shifted_newton"
+        elif use_lm:
+            delta_x, V, lam = _nr_step_lm_damping(grad, V_all, lam_all, effective_lm_mu)
+            step_record["step_mode"] = "lm_damping"
+        else:
+            delta_x, V, lam = _nr_step_hard_filter(grad, V_all, lam_all, effective_threshold, forces)
+            step_record["step_mode"] = "hard_filter"
+
+        # ---------------------------------------------------------------
+        # v3: Per-step negative-mode diagnostics
+        # ---------------------------------------------------------------
+        if n_neg > 0:
+            neg_diag = _neg_mode_diagnostics(grad, delta_x, evals_vib, evecs_vib_3N)
+            step_record["neg_mode_diag"] = neg_diag
+
+        # ---------------------------------------------------------------
+        # v4: Blind-mode correction (gradient-independent perturbation)
+        # ---------------------------------------------------------------
+        if blind_mode_threshold > 0.0 and n_neg > 0 and not use_spdn:
+            delta_x, blind_info = _blind_mode_correction(
+                delta_x, grad, evals_vib, evecs_vib_3N,
+                blind_mode_threshold, blind_correction_alpha, step,
+            )
+            step_record["blind_correction"] = blind_info
+
+        # Save coords for momentum calculation (before update)
+        if use_spdn:
+            prev_coords_flat = coords.reshape(-1).clone()
+
+        step_disp = delta_x.reshape(-1, 3)
+
+        # Deferred GDIIS storage: store (coords, grad, step) AFTER step-building
+        # so we have the Newton step vector for true GDIIS (Schlegel 2011 Eq. 16).
+        if use_spdn and gdiis is not None:
+            grad_for_diis = -forces.reshape(-1)
+            if project_gradient_and_v:
+                grad_for_diis = -project_vector_to_vibrational_torch(
+                    forces.reshape(-1), coords, atomsymbols,
+                )
+            gdiis.store(coords.reshape(-1), grad_for_diis, delta_x.clone())
+
+        if use_arc:
+            # ---------------------------------------------------------------
+            # v10: ARC step-size control (replaces trust region entirely)
+            # ---------------------------------------------------------------
+            # Safety cap on max displacement
+            capped_disp = _cap_displacement(step_disp, max_atom_disp)
+            dx_flat = capped_disp.reshape(-1).to(work_dtype)
+
+            # Predicted decrease (includes cubic term)
+            dx_red = V.T @ dx_flat
+            step_norm_arc = float(dx_flat.norm().item())
+            pred_dE_quad = float(
+                (grad.dot(dx_flat) + 0.5 * (lam * dx_red * dx_red).sum()).item()
+            )
+            pred_dE_arc = pred_dE_quad - (arc_sigma / 3.0) * step_norm_arc ** 3
+            # m(0) - m(s) = -(g^T s + 0.5 s^T H s + (sigma/3)||s||^3)
+            pred_decrease = -pred_dE_arc
+
+            new_coords = coords + capped_disp
+            arc_accepted = False
+            retries = 0
+            rho_arc = 0.0
+            actual_dE = 0.0
+
+            if _min_interatomic_distance(new_coords) < min_interatomic_dist:
+                # Geometry invalid: treat as unsuccessful
+                arc_sigma = min(arc_sigma * arc_gamma1, arc_sigma_max)
+            else:
+                out_new = predict_fn(
+                    new_coords, atomic_nums, do_hessian=True, require_grad=False,
+                )
+                energy_new = _to_float(out_new["energy"])
+                actual_dE = energy_new - energy
+
+                rho_arc = (-actual_dE) / pred_decrease if pred_decrease > 1e-12 else 0.0
+
+                if rho_arc >= arc_eta1:
+                    # successful, accept
+                    arc_accepted = True
+                    coords = new_coords.detach()
+                    out = out_new
+
+                    if rho_arc >= arc_eta2:
+                        # very successful, shrink regularization
+                        arc_sigma = max(arc_sigma * arc_gamma2, arc_sigma_min)
+                    # else: keep σ unchanged
+                else:
+                    # unsuccessful, reject and increase σ
+                    arc_sigma = min(arc_sigma * arc_gamma1, arc_sigma_max)
+
+            step_record["arc_info"].update({
+                "rho": rho_arc,
+                "pred_decrease": pred_decrease,
+                "actual_dE": actual_dE,
+                "accepted": arc_accepted,
+                "sigma_after": arc_sigma,
+                "step_norm_capped": step_norm_arc,
+            })
+
+            # v10: GDIIS acceleration (oscillation breaking + late-stage)
+            if arc_gdiis is not None:
+                arc_gdiis.store(coords.reshape(-1), grad.clone(), delta_x.clone())
+
+                # Trigger GDIIS on oscillation OR late-stage (force below threshold)
+                _oscillating = _detect_oscillation(trajectory, window=gdiis_buffer_size)
+                _late_stage = (
+                    gdiis_late_force_threshold > 0
+                    and force_norm < gdiis_late_force_threshold
+                )
+                if (step > 0
+                        and step % gdiis_every == 0
+                        and arc_gdiis.can_extrapolate()
+                        and (_oscillating or _late_stage)):
+                    arc_gdiis_attempts += 1
+                    diis_coords_flat, diis_info = arc_gdiis.extrapolate()
+                    step_record["arc_gdiis_info"] = diis_info
+
+                    if diis_coords_flat is not None:
+                        diis_coords = diis_coords_flat.reshape(-1, 3)
+                        if _min_interatomic_distance(diis_coords) >= min_interatomic_dist:
+                            diis_out = predict_fn(
+                                diis_coords, atomic_nums,
+                                do_hessian=True, require_grad=False,
+                            )
+                            diis_energy = _to_float(diis_out["energy"])
+
+                            if diis_energy < energy + 1e-6:
+                                arc_gdiis_accepts += 1
+                                coords = diis_coords.detach()
+                                out = diis_out
+                                arc_sigma = arc_sigma_init  # reset σ after GDIIS jump
+                                arc_gdiis.reset()
+                                step_record["arc_gdiis_accepted"] = True
+                                step_record["arc_gdiis_energy_change"] = diis_energy - energy
+                                step += 1
+                                continue
+                            else:
+                                step_record["arc_gdiis_accepted"] = False
+                        else:
+                            step_record["arc_gdiis_accepted"] = False
+                            step_record["arc_gdiis_reject_reason"] = "min_dist_violation"
+
+            radius_used_for_step = max_atom_disp
+
+        elif use_spdn or use_line_search:
+            # ---------------------------------------------------------------
+            # Backtracking line search (Armijo condition)
+            # Used by v5 SPDN and v7 line_search step control.
+            # ---------------------------------------------------------------
+            # Cap initial step to max_atom_disp
+            capped_disp = _cap_displacement(step_disp, max_atom_disp)
+            direction = capped_disp.reshape(-1)
+            directional_deriv = float(grad.dot(direction).item())
+
+            alpha = 1.0
+            c1 = 1e-4  # Armijo sufficient decrease constant
+            n_backtracks = 0
+            max_backtracks = 15
+            ls_accepted = False
+
+            while n_backtracks < max_backtracks:
+                trial_disp = (alpha * direction).reshape(-1, 3)
+                trial_coords = coords + trial_disp
+
+                if _min_interatomic_distance(trial_coords) < min_interatomic_dist:
+                    alpha *= 0.5
+                    n_backtracks += 1
+                    continue
+
+                trial_out = predict_fn(
+                    trial_coords, atomic_nums, do_hessian=True, require_grad=False,
+                )
+                trial_energy = _to_float(trial_out["energy"])
+
+                # Armijo condition: f(x+αd) ≤ f(x) + c₁·α·∇f·d
+                if trial_energy <= energy + c1 * alpha * directional_deriv:
+                    ls_accepted = True
+                    coords = trial_coords.detach()
+                    out = trial_out
+                    capped_disp = trial_disp
+                    break
+
+                alpha *= 0.5
+                n_backtracks += 1
+
+            if not ls_accepted:
+                # Fall back: take the last tried step
+                coords = trial_coords.detach()
+                out = trial_out
+                capped_disp = trial_disp
+
+            ls_key = "spdn_linesearch" if use_spdn else "linesearch"
+            step_record[ls_key] = {
+                "alpha": alpha,
+                "n_backtracks": n_backtracks,
+                "accepted": ls_accepted,
+                "directional_deriv": directional_deriv,
+                "energy_change": _to_float(out["energy"]) - energy,
+            }
+            radius_used_for_step = max_atom_disp  # for logging
+            retries = n_backtracks
+
+        else:
+            # ---------------------------------------------------------------
+            # Legacy: Adaptive Trust Region (v1-v4 modes)
+            # ---------------------------------------------------------------
+            accepted = False
+            max_retries = 10
+            retries = 0
+
+            while not accepted and retries < max_retries:
+                radius_used_for_step = current_trust_radius
+
+                # v4: split capping for separate neg-mode trust radius
+                if use_split_trust and n_neg > 0:
+                    capped_disp = _cap_displacement_split(
+                        step_disp, evals_vib, evecs_vib_3N,
+                        pos_trust_radius=radius_used_for_step,
+                        neg_trust_radius=current_neg_trust_radius,
+                    )
+                else:
+                    capped_disp = _cap_displacement(step_disp, radius_used_for_step)
+
+                # Predict energy change using spectral form over the modes used for the step
+                dx_flat = capped_disp.reshape(-1).to(work_dtype)
+                dx_red = V.T @ dx_flat
+                pred_dE = float((grad.dot(dx_flat) + 0.5 * (lam * dx_red * dx_red).sum()).item())
+
+                new_coords = coords + capped_disp
+
+                if _min_interatomic_distance(new_coords) < min_interatomic_dist:
+                    current_trust_radius = max(current_trust_radius * 0.5, trust_radius_floor)
+                    retries += 1
+                    continue
+
+                # Evaluate new energy
+                out_new = predict_fn(new_coords, atomic_nums, do_hessian=True, require_grad=False)
+                energy_new = _to_float(out_new["energy"])
+                actual_dE = energy_new - energy
+
+                # Actual step norm (max per-atom displacement)
+                step_max_disp = float(capped_disp.reshape(-1, 3).norm(dim=1).max().item())
+
+                # Accept if energy decreased (allow tiny numerical noise)
+                if actual_dE <= 1e-5:
+                    accepted = True
+
+                    accepted_disp = capped_disp
+                    accepted_coords = new_coords.detach()
+                    accepted_out = out_new
+                    accepted_energy = energy_new
+                    pred_dE_used = pred_dE
+
+                    if polynomial_linesearch:
+                        pls_info: Dict[str, Any] = {
+                            "enabled": True,
+                            "attempted": False,
+                            "applied": False,
+                        }
+                        if step > 0:
+                            pls_info["attempted"] = True
+                            step_vec = capped_disp.reshape(-1).to(work_dtype)
+                            step_norm = float(step_vec.norm().item())
+                            pls_info["step_norm"] = step_norm
+
+                            if step_norm > 1e-12:
+                                grad_prev_raw = -forces.reshape(-1).to(work_dtype)
+                                forces_new = out_new["forces"]
+                                if forces_new.dim() == 3 and forces_new.shape[0] == 1:
+                                    forces_new = forces_new[0]
+                                grad_curr_raw = -forces_new.reshape(-1).to(work_dtype)
+
+                                deriv_prev = float(grad_prev_raw.dot(step_vec).item())
+                                deriv_curr = float(grad_curr_raw.dot(step_vec).item())
+                                pls_info["deriv_prev"] = deriv_prev
+                                pls_info["deriv_curr"] = deriv_curr
+
+                                cubic_min = _cubic_interval_minimum(
+                                    energy, energy_new, deriv_prev, deriv_curr,
+                                )
+                                if cubic_min is not None:
+                                    t_star = cubic_min["t_star"]
+                                    pls_info.update(cubic_min)
+                                    refined_disp = capped_disp * t_star
+                                    refined_coords = coords + refined_disp
+
+                                    if _min_interatomic_distance(refined_coords) >= min_interatomic_dist:
+                                        out_refined = predict_fn(
+                                            refined_coords,
+                                            atomic_nums,
+                                            do_hessian=True,
+                                            require_grad=False,
+                                        )
+                                        refined_energy = _to_float(out_refined["energy"])
+                                        pls_info["refined_energy"] = refined_energy
+
+                                        if refined_energy < accepted_energy - 1e-8:
+                                            accepted_disp = refined_disp
+                                            accepted_coords = refined_coords.detach()
+                                            accepted_out = out_refined
+                                            accepted_energy = refined_energy
+                                            dx_ref = accepted_disp.reshape(-1).to(work_dtype)
+                                            dx_ref_red = V.T @ dx_ref
+                                            pred_dE_used = float(
+                                                (
+                                                    grad.dot(dx_ref)
+                                                    + 0.5 * (lam * dx_ref_red * dx_ref_red).sum()
+                                                ).item()
+                                            )
+                                            pls_info["applied"] = True
+                                        else:
+                                            pls_info["reject_reason"] = "not_lower_than_accepted"
+                                    else:
+                                        pls_info["reject_reason"] = "min_dist_violation"
+                                else:
+                                    pls_info["reject_reason"] = "no_interior_cubic_min"
+                            else:
+                                pls_info["reject_reason"] = "tiny_step"
+                        else:
+                            pls_info["reject_reason"] = "first_step"
+                        step_record["polynomial_linesearch"] = pls_info
+
+                    capped_disp = accepted_disp
+                    step_max_disp = float(capped_disp.reshape(-1, 3).norm(dim=1).max().item())
+                    actual_dE = accepted_energy - energy
+
+                    # Update trust radius based on rho
+                    rho = actual_dE / pred_dE_used if pred_dE_used < -1e-8 else 0.0
+
+                    if schlegel_trust_update:
+                        # Schlegel (2011): only grow if step was near boundary
+                        if rho > 0.75 and step_max_disp >= 0.8 * radius_used_for_step:
+                            current_trust_radius = min(current_trust_radius * 1.5, max_atom_disp)
+                        elif rho < 0.25:
+                            # Shrink to fraction of actual step, not fraction of radius
+                            current_trust_radius = max(0.25 * step_max_disp, trust_radius_floor)
+                        elif rho < 0.0:
+                            current_trust_radius = max(0.25 * step_max_disp, trust_radius_floor)
+                    else:
+                        if rho > 0.75:
+                            current_trust_radius = min(current_trust_radius * 1.5, max_atom_disp)
+                        elif rho < 0.25:
+                            current_trust_radius = max(current_trust_radius * 0.5, trust_radius_floor)
+                        elif rho < 0.0:
+                            # v4: softer shrink in near-zero eigenvalue regime (ρ unreliable)
+                            if aggressive_trust_recovery and abs(min_vib_eval) < 0.01:
+                                current_trust_radius = max(current_trust_radius * 0.5, trust_radius_floor)
+                            else:
+                                current_trust_radius = max(current_trust_radius * 0.25, trust_radius_floor)
+
+                    coords = accepted_coords
+                    out = accepted_out
+                else:
+                    if schlegel_trust_update:
+                        # Schlegel: shrink to fraction of actual step
+                        current_trust_radius = max(0.25 * step_max_disp, trust_radius_floor)
+                    else:
+                        # v4: softer shrink on rejection in near-zero eigenvalue regime
+                        if aggressive_trust_recovery and abs(min_vib_eval) < 0.01:
+                            current_trust_radius = max(current_trust_radius * 0.5, trust_radius_floor)
+                        else:
+                            current_trust_radius = max(current_trust_radius * 0.25, trust_radius_floor)
+                    retries += 1
+
+            if not accepted:
+                # If all retries failed, take the smallest step anyway and continue
+                coords = new_coords.detach()
+                out = out_new
+
+        # ---------------------------------------------------------------
+        # v4: Aggressive trust recovery. Reset on n_neg decrease,
+        # grow on 50-step eigenvalue improvement
+        # ---------------------------------------------------------------
+        if aggressive_trust_recovery and not use_line_search:
+            # Reset trust radius when n_neg decreased
+            if n_neg >= 0 and prev_n_neg > 0 and n_neg < prev_n_neg:
+                current_trust_radius = 0.5 * max_atom_disp
+                step_record["trust_radius_reset"] = "n_neg_decreased"
+
+            # 50-step eigenvalue improvement → grow trust radius
+            min_eval_history_50.append(min_vib_eval)
+            if len(min_eval_history_50) > 50:
+                min_eval_history_50.pop(0)
+            if len(min_eval_history_50) >= 50:
+                if min_eval_history_50[-1] > min_eval_history_50[0]:
+                    current_trust_radius = min(current_trust_radius * 2.0, max_atom_disp)
+                    step_record["trust_radius_50step_grow"] = True
+
+        # ---------------------------------------------------------------
+        # v4: Neg-mode trust radius update (eigenvalue-driven)
+        # ---------------------------------------------------------------
+        if use_split_trust and not use_line_search:
+            if n_neg > 0 and prev_min_vib_eval_for_trust is not None:
+                if min_vib_eval > prev_min_vib_eval_for_trust:
+                    # Eigenvalue improved (less negative) → expand
+                    current_neg_trust_radius = min(
+                        current_neg_trust_radius * 1.5, max_atom_disp,
+                    )
+                else:
+                    # Eigenvalue worsened → shrink gently
+                    current_neg_trust_radius = max(
+                        current_neg_trust_radius * 0.7, neg_trust_floor,
+                    )
+            # Reset when n_neg decreased
+            if n_neg >= 0 and prev_n_neg > 0 and n_neg < prev_n_neg:
+                current_neg_trust_radius = max_atom_disp
+            elif n_neg == 0:
+                current_neg_trust_radius = max_atom_disp
+
+            prev_min_vib_eval_for_trust = min_vib_eval
+
+        # ---------------------------------------------------------------
+        # v12: Oscillation kick
+        # ---------------------------------------------------------------
+        if osc_kick and mode_tracker is not None:
+            osc_kick_cooldown_counter = max(0, osc_kick_cooldown_counter - 1)
+
+            is_oscillating = _detect_oscillation(trajectory, window=8)
+            at_trust_floor = current_trust_radius <= trust_radius_floor * 1.01
+
+            if is_oscillating and at_trust_floor:
+                osc_kick_consec += 1
+            else:
+                osc_kick_consec = 0
+
+            if (osc_kick_consec >= osc_kick_patience
+                    and osc_kick_cooldown_counter == 0):
+                # Select kick mode based on eigvec_index
+                if kick_eigvec_index == 0:
+                    kick_mode = mode_tracker.longest_stuck()
+                else:
+                    kick_mode = mode_tracker.second_longest_stuck()
+
+                if kick_mode is not None:
+                    kick_vec = kick_mode["eigvec"].to(dtype=coords.dtype, device=coords.device)
+                    if adaptive_kick_scale:
+                        # v12b: scale with |λ_min|^{1/2}, clamped to [floor, 10*floor]
+                        abs_eval = abs(kick_mode["eigenvalue"])
+                        kick_mag = max(
+                            trust_radius_floor,
+                            min(adaptive_kick_C * abs_eval ** 0.5, 10.0 * trust_radius_floor),
+                        )
+                    else:
+                        kick_mag = osc_kick_scale * trust_radius_floor
+
+                    # Sign: follow gradient component direction
+                    _grad_for_kick = -forces.reshape(-1)
+                    if project_gradient_and_v:
+                        _grad_for_kick = -project_vector_to_vibrational_torch(
+                            forces.reshape(-1), coords, atomsymbols,
+                        )
+                    g_dot_v = float((_grad_for_kick.to(dtype=kick_vec.dtype) @ kick_vec).item())
+                    if abs(g_dot_v) < 1e-12:
+                        kick_sign = 1.0 if random.random() < 0.5 else -1.0
+                    else:
+                        kick_sign = 1.0 if g_dot_v > 0 else -1.0
+
+                    kick_disp = (kick_sign * kick_mag * kick_vec).reshape(-1, 3)
+                    kicked_coords = coords + kick_disp
+
+                    if _min_interatomic_distance(kicked_coords) >= min_interatomic_dist:
+                        # Accept unconditionally (we're stuck)
+                        kick_out = predict_fn(
+                            kicked_coords, atomic_nums,
+                            do_hessian=True, require_grad=False,
+                        )
+                        coords = kicked_coords.detach()
+                        out = kick_out
+
+                        # Reset trust radius to 2x floor
+                        current_trust_radius = min(2.0 * trust_radius_floor, max_atom_disp)
+
+                        osc_kick_consec = 0
+                        osc_kick_cooldown_counter = osc_kick_cooldown
+                        total_osc_kicks += 1
+
+                        step_record["osc_kick"] = {
+                            "fired": True,
+                            "kick_mag": kick_mag,
+                            "kick_sign": kick_sign,
+                            "mode_age": kick_mode["age"],
+                            "mode_eval": kick_mode["eigenvalue"],
+                            "eigvec_index": kick_eigvec_index,
+                            "energy_before": energy,
+                            "energy_after": _to_float(kick_out["energy"]),
+                        }
+
+        # ---------------------------------------------------------------
+        # v12: Blind-mode kick
+        # ---------------------------------------------------------------
+        if blind_kick and mode_tracker is not None:
+            blind_kick_cooldown_counter = max(0, blind_kick_cooldown_counter - 1)
+
+            if (force_norm < blind_kick_force_thresh
+                    and n_neg > 0
+                    and blind_kick_cooldown_counter == 0):
+                # Select blind mode
+                if kick_eigvec_index == 0:
+                    blind_mode = mode_tracker.longest_blind(blind_kick_overlap_thresh)
+                else:
+                    blind_mode = mode_tracker.second_longest_blind(blind_kick_overlap_thresh)
+
+                if (blind_mode is not None
+                        and blind_mode["blind_age"] >= blind_kick_patience):
+                    blind_vec = blind_mode["eigvec"].to(dtype=coords.dtype, device=coords.device)
+
+                    if adaptive_kick_scale:
+                        abs_eval = abs(blind_mode["eigenvalue"])
+                        blind_mag = max(
+                            trust_radius_floor,
+                            min(adaptive_kick_C * abs_eval ** 0.5, 10.0 * trust_radius_floor),
+                        )
+                    else:
+                        blind_mag = blind_kick_scale * trust_radius_floor
+
+                    best_kick_coords = None
+                    best_kick_out = None
+                    best_kick_sign = 0.0
+                    best_kick_energy = float("inf")
+                    best_kick_mag = blind_mag
+                    probe_n_neg_improved = False
+
+                    if blind_kick_probe:
+                        # v12b: line-probe at increasing magnitudes,
+                        # accept first point where n_neg decreases
+                        for pf in _probe_factors:
+                            pmag = pf * trust_radius_floor
+                            for psign in [1.0, -1.0]:
+                                pcoords = coords + (psign * pmag * blind_vec).reshape(-1, 3)
+                                if _min_interatomic_distance(pcoords) < min_interatomic_dist:
+                                    continue
+                                pout = predict_fn(
+                                    pcoords, atomic_nums,
+                                    do_hessian=True, require_grad=False,
+                                )
+                                pforces = pout["forces"]
+                                if pforces.dim() == 3 and pforces.shape[0] == 1:
+                                    pforces = pforces[0]
+                                pevals, _, _ = get_vib_evals_evecs(
+                                    pout["hessian"], pcoords, atomsymbols,
+                                    purify_hessian=purify_hessian,
+                                )
+                                pn_neg = int((pevals < 0.0).sum().item())
+                                pe = _to_float(pout["energy"])
+
+                                if pn_neg < n_neg:
+                                    # n_neg decreased, accept immediately
+                                    best_kick_coords = pcoords
+                                    best_kick_out = pout
+                                    best_kick_sign = psign
+                                    best_kick_energy = pe
+                                    best_kick_mag = pmag
+                                    probe_n_neg_improved = True
+                                    break
+                                elif pe < best_kick_energy:
+                                    best_kick_coords = pcoords
+                                    best_kick_out = pout
+                                    best_kick_sign = psign
+                                    best_kick_energy = pe
+                                    best_kick_mag = pmag
+                            if probe_n_neg_improved:
+                                break
+                    else:
+                        # Original v12: try ±v at fixed magnitude
+                        for bsign in [1.0, -1.0]:
+                            bcoords = coords + (bsign * blind_mag * blind_vec).reshape(-1, 3)
+                            if _min_interatomic_distance(bcoords) < min_interatomic_dist:
+                                continue
+                            bout = predict_fn(
+                                bcoords, atomic_nums,
+                                do_hessian=True, require_grad=False,
+                            )
+                            be = _to_float(bout["energy"])
+                            if be < best_kick_energy:
+                                best_kick_energy = be
+                                best_kick_coords = bcoords
+                                best_kick_out = bout
+                                best_kick_sign = bsign
+
+                    if best_kick_coords is not None:
+                        coords = best_kick_coords.detach()
+                        out = best_kick_out
+
+                        # Reset trust radius to 2x floor
+                        current_trust_radius = min(2.0 * trust_radius_floor, max_atom_disp)
+
+                        blind_kick_cooldown_counter = 200
+                        total_blind_kicks += 1
+
+                        step_record["blind_kick"] = {
+                            "fired": True,
+                            "kick_mag": best_kick_mag,
+                            "kick_sign": best_kick_sign,
+                            "mode_blind_age": blind_mode["blind_age"],
+                            "mode_eval": blind_mode["eigenvalue"],
+                            "mode_grad_overlap": blind_mode["grad_overlap"],
+                            "eigvec_index": kick_eigvec_index,
+                            "energy_before": energy,
+                            "energy_after": best_kick_energy,
+                            "probe": blind_kick_probe,
+                            "n_neg_improved": probe_n_neg_improved,
+                        }
+
+        # ---------------------------------------------------------------
+        # v12b: Late-stage aggressive escape
+        # ---------------------------------------------------------------
+        if late_escape and mode_tracker is not None:
+            late_escape_cooldown_counter = max(0, late_escape_cooldown_counter - 1)
+
+            if (step >= late_escape_after
+                    and n_neg > 0
+                    and late_escape_cooldown_counter == 0):
+                # Select mode: longest stuck negative mode
+                if kick_eigvec_index == 0:
+                    late_mode = mode_tracker.longest_stuck()
+                else:
+                    late_mode = mode_tracker.second_longest_stuck()
+
+                if late_mode is not None:
+                    late_vec = late_mode["eigvec"].to(dtype=coords.dtype, device=coords.device)
+
+                    # Try both directions, accept if n_neg decreases
+                    best_late_coords = None
+                    best_late_out = None
+                    best_late_sign = 0.0
+                    best_late_n_neg = n_neg
+
+                    for lsign in [1.0, -1.0]:
+                        lcoords = coords + (lsign * late_escape_alpha * late_vec).reshape(-1, 3)
+                        if _min_interatomic_distance(lcoords) < min_interatomic_dist:
+                            continue
+                        lout = predict_fn(
+                            lcoords, atomic_nums,
+                            do_hessian=True, require_grad=False,
+                        )
+                        levals, _, _ = get_vib_evals_evecs(
+                            lout["hessian"], lcoords, atomsymbols,
+                            purify_hessian=purify_hessian,
+                        )
+                        ln_neg = int((levals < 0.0).sum().item())
+
+                        if ln_neg < best_late_n_neg:
+                            best_late_n_neg = ln_neg
+                            best_late_coords = lcoords
+                            best_late_out = lout
+                            best_late_sign = lsign
+
+                    if best_late_coords is not None and best_late_n_neg < n_neg:
+                        coords = best_late_coords.detach()
+                        out = best_late_out
+
+                        current_trust_radius = min(2.0 * trust_radius_floor, max_atom_disp)
+                        late_escape_cooldown_counter = late_escape_cooldown
+                        total_late_escapes += 1
+
+                        step_record["late_escape"] = {
+                            "fired": True,
+                            "alpha": late_escape_alpha,
+                            "sign": best_late_sign,
+                            "mode_age": late_mode["age"],
+                            "mode_eval": late_mode["eigenvalue"],
+                            "n_neg_before": n_neg,
+                            "n_neg_after": best_late_n_neg,
+                        }
+
+        actual_step_disp = float(capped_disp.reshape(-1, 3).norm(dim=1).max().item())
+        trajectory[-1]["actual_step_disp"] = actual_step_disp
+        trajectory[-1]["hit_trust_radius"] = bool(actual_step_disp >= radius_used_for_step * 0.99)
+        trajectory[-1]["retries"] = retries
+
+        step += 1
+
+        # In cleanup phase, cap extra steps taken
+        if in_cleanup_phase:
+            cleanup_steps_taken += 1
+            if cleanup_steps_taken >= cleanup_max_steps:
+                break
+
+    last = trajectory[-1] if trajectory else {}
+    timeout_result: Dict[str, Any] = {
+        "converged": False,
+        "convergence_class": "STALLED",
+        "converged_step": None,
+        "final_energy": last.get("energy", float("nan")),
+        "final_force_norm": last.get("force_norm", float("nan")),
+        "final_coords": coords.detach().cpu(),
+        "total_steps": len(trajectory),
+        "final_n_neg_evals": last.get("n_neg_evals", -1),
+        "final_n_neg_total_hessian": last.get("n_neg_total_hessian", -1),
+        "final_min_vib_eval": last.get("min_vib_eval", float("nan")),
+        "final_spectral_gap_ratio": last.get("spectral_gap_ratio", float("nan")),
+        "final_dominant_neg_mode": last.get("dominant_neg_mode", False),
+        "cascade_at_convergence": {k: last.get(k) for k in last if k.startswith("n_neg_at_")},
+        "bottom_spectrum_at_convergence": last.get("bottom_spectrum", []),
+        "cleanup_steps_taken": cleanup_steps_taken,
+        "total_escapes": total_escapes,
+        "total_line_searches": total_line_searches,
+        "total_mode_follows": total_mode_follows,
+    }
+    if use_spdn:
+        timeout_result["total_diis_attempts"] = total_diis_attempts
+        timeout_result["total_diis_accepts"] = total_diis_accepts
+        timeout_result["total_diis_energy_accepts"] = total_diis_energy_accepts
+        timeout_result["optimizer_mode"] = "spdn"
+    if use_arc:
+        timeout_result["optimizer_mode"] = "arc"
+        timeout_result["final_arc_sigma"] = arc_sigma
+        timeout_result["arc_gdiis_attempts"] = arc_gdiis_attempts
+        timeout_result["arc_gdiis_accepts"] = arc_gdiis_accepts
+    if use_rfo:
+        timeout_result["optimizer_mode"] = "rfo"
+    if osc_kick or blind_kick or late_escape:
+        timeout_result["total_osc_kicks"] = total_osc_kicks
+        timeout_result["total_blind_kicks"] = total_blind_kicks
+        timeout_result["total_late_escapes"] = total_late_escapes
+    return timeout_result, trajectory
