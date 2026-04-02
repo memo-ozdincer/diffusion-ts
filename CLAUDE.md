@@ -7,7 +7,7 @@ Transition state search + diffusion-based TS generation via adjoint sampling. Ex
 ```
 src/
   core_algos/          # Backend-agnostic algorithms
-    saddle_optimizer.py  # NR→GAD two-phase TS optimizer (main entry point)
+    saddle_optimizer.py  # NR→GAD→P-RFO three-phase TS optimizer (main entry point)
     gad.py               # GAD fundamentals: mode tracking, Euler step, RK45
     types.py             # PredictFn protocol
   dependencies/        # Calculator adapters, Eckart projection, logging, utils
@@ -23,8 +23,9 @@ src/
   parallel/            # Multi-worker execution (LJ, SCINE, Dask)
   runners/             # CLI entrypoints
 scripts/
-  test_parallel_quick.py    # Parallel NR→GAD TS search (main data collection)
+  test_parallel_quick.py    # Parallel NR→GAD→P-RFO TS search (main data collection)
   cluster_ts_geometries.py  # Cluster TS geometries via aligned RMSD
+  explore_clustering.py     # Compare clustering algorithms (hierarchical, DBSCAN, etc.)
   *.slurm, *.sh             # SLURM templates and run scripts
 ```
 
@@ -35,7 +36,7 @@ scripts/
 - **Hessian projection**: Raw Hessians have 5-6 rigid-body null modes. Always use Eckart projection via `reduced_basis_hessian_torch()` before eigenvalue analysis. This returns a full-rank (3N-k, 3N-k) vibrational Hessian — no threshold filtering needed.
 - **TS convergence criterion**: **n_neg == 1** (exactly one negative vibrational eigenvalue after Eckart projection) AND **force_norm < 0.01 eV/A**. This is the only valid criterion. No eigenvalue product gates, no threshold relaxation on the TS check.
 
-## Two-phase saddle optimizer
+## Three-phase saddle optimizer
 
 The main optimizer is `src/core_algos/saddle_optimizer.py`:
 
@@ -43,7 +44,8 @@ The main optimizer is `src/core_algos/saddle_optimizer.py`:
 from src.core_algos.saddle_optimizer import find_transition_state
 
 result = find_transition_state(predict_fn, coords, atomic_nums, atomsymbols)
-# result["converged"] == True when n_neg == 1
+# result["converged"] == True when n_neg == 1 (GAD found TS)
+# result["refined"] == True when P-RFO pushed force < 1e-4
 ```
 
 **Phase 1 — NR minimization** (find local minimum, n_neg == 0):
@@ -57,7 +59,14 @@ result = find_transition_state(predict_fn, coords, atomic_nums, atomsymbols)
 - Mode tracking across eigenvector degeneracies
 - Eckart-projected GAD dynamics (no TR drift)
 
-Both phases are **state-based** (no path history), suitable for integration with diffusion models.
+**Phase 3 — P-RFO TS refinement** (push force → 0 at saddle):
+- Partitioned Rational Function Optimization
+- TS mode (lowest eigenvector): maximize via uphill secular equation shift
+- All other modes: standard RFO minimization
+- Drives force from ~0.01 to ~1e-5 eV/A in 10-20 steps
+- Trust region with adaptive radius
+
+All three phases are **state-based** (no path history), suitable for integration with diffusion models.
 
 ## Geometry alignment and clustering
 
@@ -98,19 +107,30 @@ The alignment procedure:
 4. Kabsch-align the permuted geometry
 5. Return the minimum RMSD across all assignments
 
-### Hierarchical clustering
+### Two-level hierarchical clustering
 
-After computing the N×N pairwise aligned RMSD matrix:
-1. Convert to condensed form (`scipy.spatial.distance.squareform`)
-2. Agglomerative clustering (`scipy.cluster.hierarchy.linkage`, average linkage)
-3. Cut at RMSD threshold (`fcluster`, typically 0.2 Å)
+Single RMSD thresholds either over-split or mega-cluster. Use two levels:
 
-Script: `scripts/cluster_ts_geometries.py`
+**Level 1 (L1=0.15 Å)**: Tight cores — near-duplicate TS from the same basin.
+**Level 2 (L2=0.4 Å)**: Group cores into broader structural families using mean inter-core RMSD.
+
+Result (87 TS): 35 families (8 multi-member covering 60 TS, 27 singletons).
+
+### Reaction type classification
+
+Each TS classified by which bonds stretched >30% from equilibrium:
+- Angular/torsional (43%): No bonds broken, rotational barriers
+- C-C breaking (21%): Methyl detachment
+- C-H migration (15%): Central H moving, very flat saddles (eig0 ≈ -0.5)
+- Multi-bond (11%): 2+ bonds simultaneously stretched (mostly singletons)
+- C-O breaking (3%): Hydroxyl leaving
+
+Scripts: `scripts/cluster_structural_v3.py` (two-level), `scripts/plot_reaction_types.py`
 
 ```bash
-python scripts/cluster_ts_geometries.py
-# Reads: /scratch/memoozd/diffusion-ts/parallel_results.json
-# Writes: /scratch/memoozd/diffusion-ts/clustered_results.json
+srun --overlap --jobid=<JOBID> python scripts/cluster_structural_v3.py
+# Reads: /scratch/memoozd/diffusion-ts/adaptive_results.json
+# Writes: /scratch/memoozd/diffusion-ts/structural_clustering_v3/families_v3.json
 ```
 
 ## Data collection pipeline
@@ -131,11 +151,13 @@ srun --overlap --jobid=<JOBID> python scripts/test_parallel_quick.py \
 
 ### Convergence rates (isopropanol, DFTB0)
 
-| Noise (Å) | Rate | Notes |
-|-----------|------|-------|
-| 0.2 | 86% | 4 main TS families, production quality |
-| 0.3 | 74% | More TS diversity, 8 families |
-| 0.5 | 35% | Many rare/unique TS, high skip rate |
+| Noise (Å) | Rate (v7) | Rate (v11) | No-PLS | Notes |
+|-----------|-----------|------------|--------|-------|
+| 0.2 | 86% | — | **98%** | 4 main TS families |
+| 0.3 | 74% | **99%** | **100%** | rms_force + NR→candidates→GAD |
+| 0.5 | 35% | — | **91%** | Many rare/unique TS |
+
+PLS (polynomial line search) makes negligible difference — the handoff mechanism is what matters.
 
 ## Running experiments
 

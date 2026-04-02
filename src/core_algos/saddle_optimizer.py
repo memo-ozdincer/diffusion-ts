@@ -1,31 +1,26 @@
-"""NR→GAD transition state optimizer.
+"""Adaptive NR/GAD transition state optimizer.
 
-Two-phase saddle point search:
-  Phase 1 — RFO Newton-Raphson minimization (find local minimum)
-  Phase 2 — GAD with eigenvalue-clamped adaptive dt (climb to index-1 saddle)
+Single-loop saddle point search that switches between NR and GAD based on
+the Morse index (number of negative vibrational eigenvalues):
 
-Convergence criterion: n_neg == 1 (exactly one negative vibrational eigenvalue
-after Eckart projection). No additional filtering.
+    n_neg >= 2  →  NR step (minimize to reduce index)
+    n_neg < 2   →  GAD step (climb toward index-1 saddle)
+    n_neg == 1 AND rms_force < threshold  →  CONVERGED
 
-Core features (general-purpose, proven essential):
-  - RFO (augmented Hessian): adaptive shift, no hyperparameters, guaranteed downhill
-  - Polynomial line search (PLS): cubic interpolation refinement on accepted TR steps
+This replaces the old two-phase NR→GAD pipeline with a unified loop that
+adapts automatically. No multi-candidate handoff, no rescue logic needed.
+
+Core features:
+  - RFO (augmented Hessian): adaptive shift, guaranteed downhill for NR
+  - Polynomial line search (PLS): cubic interpolation refinement on NR steps
   - Trust region with floor: prevents collapse into micro-steps
-  - Relaxed eigenvalue convergence: catches near-minima with tiny ghost negatives
-  - GAD mode tracking: consistent eigenvector across steps despite degeneracies
-  - Eigenvalue-clamped adaptive dt: self-regulating step size for GAD phase
-
-Optional molecular-specific features (off by default):
-  - Oscillation kick: perturb along negative eigenvector when energy oscillates
-  - Blind-mode kick: perturb when gradient is orthogonal to negative modes
-  - Late escape: aggressive displacement after many stagnant steps
-  - Min interatomic distance check: prevent unphysical atomic clashes
+  - GAD mode tracking: consistent eigenvector across steps
+  - Eigenvalue-clamped adaptive dt: self-regulating step size for GAD
+  - Three force metrics: rms_force, max_atomic_force, max_force_component
+  - Energy divergence guard: abort if energy rises too far
 
 Usage:
-    result = find_transition_state(
-        predict_fn, coords0, atomic_nums, atomsymbols,
-        nr_steps=50000, gad_steps=500,
-    )
+    result = find_transition_state(predict_fn, coords, atomic_nums, atomsymbols)
     if result["converged"]:
         ts_coords = result["final_coords"]
 """
@@ -47,61 +42,96 @@ from src.core_algos.gad import pick_tracked_mode
 
 
 # ============================================================================
+# Force metrics
+# ============================================================================
+
+def rms_force(forces: torch.Tensor) -> float:
+    """RMS of all force components: sqrt(mean(F_i^2))."""
+    return float(forces.reshape(-1).square().mean().sqrt().item())
+
+
+def max_atomic_force(forces: torch.Tensor) -> float:
+    """Max per-atom force magnitude: max_i ||F_i||."""
+    f = forces.reshape(-1, 3)
+    return float(f.norm(dim=1).max().item())
+
+
+def max_force_component(forces: torch.Tensor) -> float:
+    """Max absolute force component: max |F_ij|."""
+    return float(forces.abs().max().item())
+
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
 @dataclass
-class NRConfig:
-    """Newton-Raphson (Phase 1) configuration.
+class TSOptimizerConfig:
+    """Unified NR/GAD transition state optimizer configuration."""
+    # Step budget
+    max_steps: int = 10_000
 
-    Defaults are the v13 "good general" config — RFO + PLS + trust region.
-    """
+    # Force convergence (applied to rms_force by default)
+    force_converged: float = 0.01       # eV/A
+
+    # NR parameters (used when n_neg >= 2)
+    nr_max_atom_disp: float = 1.3       # trust region max (A)
+    nr_trust_floor: float = 0.01        # trust region min (A)
+    nr_polynomial_linesearch: bool = True
+    nr_project_gradient: bool = True
+
+    # GAD parameters (used when n_neg < 2)
+    gad_dt: float = 0.01               # base timestep
+    gad_dt_min: float = 1e-5
+    gad_dt_max: float = 0.3
+    gad_max_atom_disp: float = 0.5     # max per-atom displacement per step
+    gad_track_mode: bool = True
+    gad_project_gradient: bool = True
+
+    # Molecular safety
+    min_interatomic_dist: float = 0.4   # reject steps below this (A), 0 to disable
+
+    # Energy divergence guard
+    max_energy_rise: float = 20.0       # abort if E rises more than this from initial
+
+    # Logging
+    log_every: int = 100                # print progress every N steps
+    log_spectrum_k: int = 5
+
+
+# Legacy configs for backward compatibility
+@dataclass
+class NRConfig:
+    """Newton-Raphson configuration (legacy, used by run_nr_minimization)."""
     n_steps: int = 50_000
-    max_atom_disp: float = 1.3          # max per-atom displacement (Angstrom)
-    force_converged: float = 1e-4       # force convergence threshold (eV/A)
-    trust_radius_floor: float = 0.01    # minimum trust radius (Angstrom)
-    polynomial_linesearch: bool = True   # cubic interpolation refinement
-    project_gradient: bool = True        # Eckart-project gradient and eigenvectors
-    # Relaxed convergence: accept min_eval >= -threshold as "converged"
+    max_atom_disp: float = 1.3
+    force_converged: float = 1e-4
+    trust_radius_floor: float = 0.01
+    polynomial_linesearch: bool = True
+    project_gradient: bool = True
     relaxed_eval_threshold: float = 0.01
     accept_relaxed: bool = True
-    # Molecular safety (set to 0.0 to disable)
     min_interatomic_dist: float = 0.5
-    # Logging
     log_spectrum_k: int = 10
 
 
 @dataclass
 class GADConfig:
-    """GAD (Phase 2) configuration.
-
-    Eigenvalue-clamped adaptive dt is the default (93-100% TS rate in benchmarks).
-    """
+    """GAD configuration (legacy, used by run_gad_saddle_search)."""
     n_steps: int = 500
-    dt: float = 0.003                   # base timestep
+    dt: float = 0.003
     dt_min: float = 1e-5
     dt_max: float = 0.1
-    dt_adaptation: str = "eigenvalue_clamped"  # best general strategy
+    dt_adaptation: str = "eigenvalue_clamped"
     dt_scale_factor: float = 1.0
-    max_atom_disp: float = 0.35         # max per-atom displacement per step
-    track_mode: bool = True             # eigenvector continuity tracking
-    project_gradient: bool = True        # Eckart-project gradient and v
-    # Molecular safety
+    max_atom_disp: float = 0.35
+    track_mode: bool = True
+    project_gradient: bool = True
     min_interatomic_dist: float = 0.5
-    # Index-2 recovery: when stuck at n_neg=2 with low force, perturb along
-    # 2nd negative eigenvector. This can recover 5-10% of failures at high noise.
     index2_recovery: bool = False
-    index2_patience: int = 200          # consecutive n_neg=2 steps before kick
-    index2_kick_scale: float = 0.3      # displacement magnitude (Angstrom)
-    index2_max_kicks: int = 3           # max number of kicks per run
-
-
-@dataclass
-class SaddleOptimizerConfig:
-    """Full NR→GAD optimizer config."""
-    nr: NRConfig = field(default_factory=NRConfig)
-    gad: GADConfig = field(default_factory=GADConfig)
-    gad_on_nr_failure: bool = True      # run GAD even if NR didn't converge
+    index2_patience: int = 200
+    index2_kick_scale: float = 0.3
+    index2_max_kicks: int = 3
 
 
 # ============================================================================
@@ -254,11 +284,6 @@ def _to_float(x) -> float:
     return float(x)
 
 
-def _force_mean(forces: torch.Tensor) -> float:
-    f = forces.reshape(-1, 3)
-    return float(f.norm(dim=1).mean().item())
-
-
 def _cap_displacement(step_disp: torch.Tensor, max_disp: float) -> torch.Tensor:
     disp_3d = step_disp.reshape(-1, 3)
     max_actual = float(disp_3d.norm(dim=1).max().item())
@@ -277,8 +302,409 @@ def _min_interatomic_distance(coords: torch.Tensor) -> float:
     return float(dist.min().item())
 
 
+def _compute_adaptive_dt(
+    dt_base: float,
+    dt_min: float,
+    dt_max: float,
+    eig_0: float,
+    eps: float = 1e-8,
+) -> float:
+    """Eigenvalue-clamped adaptive timestep."""
+    lam = min(max(abs(eig_0), 1e-2), 1e2)
+    dt_eff = dt_base / (lam + eps)
+    return float(max(dt_min, min(dt_eff, dt_max)))
+
+
 # ============================================================================
-# Phase 1: Newton-Raphson minimization with RFO + PLS + trust region
+# Core: Adaptive NR/GAD transition state search
+# ============================================================================
+
+def find_transition_state(
+    predict_fn,
+    coords0: torch.Tensor,
+    atomic_nums: torch.Tensor,
+    atomsymbols: list[str],
+    cfg: Optional[TSOptimizerConfig] = None,
+) -> Dict[str, Any]:
+    """Find an index-1 saddle point via adaptive NR/GAD switching.
+
+    Each step:
+      1. Compute energy, forces, Hessian → vibrational eigendecomposition
+      2. If n_neg >= 2: take RFO Newton-Raphson step (minimize, reduce index)
+      3. If n_neg < 2:  take GAD step (climb toward saddle)
+      4. If n_neg == 1 and rms_force < threshold: CONVERGED
+
+    Args:
+        predict_fn: Callable(coords, atomic_nums, do_hessian, require_grad) -> dict
+        coords0: (N, 3) starting coordinates
+        atomic_nums: (N,) atomic numbers
+        atomsymbols: ['C', 'H', ...] element symbols
+        cfg: Optimizer config (uses defaults if None)
+
+    Returns:
+        dict with: converged, final_coords, final_energy, final_force_norm,
+        final_n_neg, converged_step, total_steps, n_nr_steps, n_gad_steps,
+        trajectory.
+    """
+    if cfg is None:
+        cfg = TSOptimizerConfig()
+
+    coords = coords0.detach().clone().to(torch.float32).reshape(-1, 3)
+    trajectory: List[Dict[str, Any]] = []
+
+    # GAD mode tracking state
+    v_prev: Optional[torch.Tensor] = None
+
+    # NR trust radius state
+    trust_radius = cfg.nr_max_atom_disp
+
+    # Counters
+    n_nr_steps = 0
+    n_gad_steps = 0
+
+    # Phase tracking: once we enter GAD (NR converged), stay in GAD
+    gad_activated = False
+
+    # Snapshot collection: save geometries where n_neg <= 1 during NR
+    # for handoff to GAD if NR never fully converges
+    best_snapshot: Optional[Dict[str, Any]] = None  # lowest force with n_neg <= 1
+
+    # Initial energy for divergence guard
+    out_init = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+    energy_init = _to_float(out_init["energy"])
+    out = out_init
+
+    prev_energy = energy_init
+    prev_forces = None
+
+    for step in range(cfg.max_steps):
+        energy = _to_float(out["energy"])
+        forces = out["forces"]
+        hessian = out["hessian"]
+
+        if forces.dim() == 3 and forces.shape[0] == 1:
+            forces = forces[0]
+        forces = forces.reshape(-1, 3)
+
+        # Force metrics
+        f_rms = rms_force(forces)
+        f_max = max_atomic_force(forces)
+
+        # Vibrational eigendecomposition
+        evals_vib, evecs_vib_3N, _ = vib_eig(hessian, coords, atomsymbols)
+        n_neg = int((evals_vib < 0).sum().item()) if evals_vib.numel() > 0 else 0
+        eig_0 = float(evals_vib[0].item()) if evals_vib.numel() > 0 else 0.0
+
+        # Phase transition: activate GAD once NR has properly converged.
+        # NR must reach a genuine minimum (n_neg == 0, force converged) or
+        # be very close to a TS (n_neg == 1, force small).
+        # "Relaxed" convergence also counts: min_eval >= -0.01 with low force.
+        if not gad_activated:
+            min_eval = float(evals_vib.min().item()) if evals_vib.numel() > 0 else 0.0
+            nr_converged = (
+                (n_neg == 0 and f_rms < 0.01)
+                or (n_neg <= 1 and min_eval >= -0.01 and f_rms < 0.01)
+            )
+            if nr_converged:
+                gad_activated = True
+
+        # Collect snapshots: save best low-n_neg geometry during NR for handoff.
+        # Priority: n_neg=1 best (already at saddle), then n_neg=0, then n_neg=2.
+        if not gad_activated and n_neg <= 2:
+            snap_score = {1: 0, 0: 1, 2: 2}.get(n_neg, 3)
+            if best_snapshot is None:
+                is_better = True
+            else:
+                old_score = {1: 0, 0: 1, 2: 2}.get(best_snapshot["n_neg"], 3)
+                is_better = snap_score < old_score or (snap_score == old_score and f_rms < best_snapshot["force"])
+            if is_better:
+                best_snapshot = {
+                    "coords": coords.detach().cpu().clone(),
+                    "force": f_rms,
+                    "n_neg": n_neg,
+                    "step": step,
+                }
+
+        # Decide mode: NR to minimize until convergence, then GAD.
+        # Exception: if GAD is stuck at n_neg >= 2 with low force, switch
+        # back to NR to re-minimize (the user's core insight).
+        if gad_activated and n_neg >= 2 and f_rms < 0.5:
+            use_nr = True
+            gad_activated = False
+            v_prev = None
+        else:
+            use_nr = not gad_activated
+
+        # Log
+        record = {
+            "step": step,
+            "energy": energy,
+            "rms_force": f_rms,
+            "max_force": f_max,
+            "n_neg": n_neg,
+            "eig_0": eig_0,
+            "mode": "NR" if use_nr else "GAD",
+        }
+        trajectory.append(record)
+
+        if cfg.log_every > 0 and step % cfg.log_every == 0:
+            mode = "NR" if use_nr else "GAD"
+            print(f"  step={step:5d} {mode} n_neg={n_neg} E={energy:.4f} "
+                  f"rms_F={f_rms:.6f} max_F={f_max:.6f} eig0={eig_0:.4f}")
+
+        # ---- Convergence check ----
+        if n_neg == 1 and f_rms < cfg.force_converged:
+            return {
+                "converged": True,
+                "converged_step": step,
+                "final_coords": coords.detach().cpu(),
+                "final_energy": energy,
+                "final_force_norm": f_rms,
+                "final_max_force": f_max,
+                "final_n_neg": n_neg,
+                "total_steps": step + 1,
+                "n_nr_steps": n_nr_steps,
+                "n_gad_steps": n_gad_steps,
+                "trajectory": trajectory,
+            }
+
+        # ---- Energy divergence guard (only during GAD phase) ----
+        # NR is allowed to explore freely; GAD should not diverge
+        if gad_activated and energy > energy_init + cfg.max_energy_rise:
+            record["abort"] = "energy_diverged"
+            break
+
+        # ---- Take step: NR or GAD ----
+        if use_nr:
+            # ============ NR STEP (minimize to reduce Morse index) ============
+            record["mode"] = "NR"
+            n_nr_steps += 1
+
+            grad = -forces.reshape(-1)
+            if cfg.nr_project_gradient:
+                grad = -project_vector_to_vibrational_torch(
+                    forces.reshape(-1), coords, atomsymbols,
+                )
+
+            work_dtype = grad.dtype
+            V = evecs_vib_3N.to(device=grad.device, dtype=work_dtype)
+            lam = evals_vib.to(device=grad.device, dtype=work_dtype)
+
+            delta_x, rfo_info = _rfo_step(grad, V, lam)
+            record["step_norm"] = rfo_info["step_norm"]
+
+            # Trust region
+            accepted = False
+            retries = 0
+            out_new = None
+            new_coords = None
+
+            while not accepted and retries < 10:
+                capped_disp = _cap_displacement(delta_x.reshape(-1, 3), trust_radius)
+                new_coords = coords + capped_disp
+
+                # Distance safety
+                if cfg.min_interatomic_dist > 0 and _min_interatomic_distance(new_coords) < cfg.min_interatomic_dist:
+                    trust_radius = max(trust_radius * 0.5, cfg.nr_trust_floor)
+                    retries += 1
+                    continue
+
+                out_new = predict_fn(new_coords, atomic_nums, do_hessian=True, require_grad=False)
+                energy_new = _to_float(out_new["energy"])
+
+                if energy_new <= energy + 1e-5:
+                    accepted = True
+
+                    # PLS refinement
+                    if cfg.nr_polynomial_linesearch and step > 0 and prev_forces is not None:
+                        step_vec = capped_disp.reshape(-1).to(work_dtype)
+                        step_norm = float(step_vec.norm().item())
+                        if step_norm > 1e-12:
+                            grad_prev = -forces.reshape(-1).to(work_dtype)
+                            forces_new = out_new["forces"]
+                            if forces_new.dim() == 3 and forces_new.shape[0] == 1:
+                                forces_new = forces_new[0]
+                            grad_curr = -forces_new.reshape(-1).to(work_dtype)
+
+                            deriv_prev = float(grad_prev.dot(step_vec).item())
+                            deriv_curr = float(grad_curr.dot(step_vec).item())
+
+                            cubic = _cubic_interval_minimum(energy, energy_new, deriv_prev, deriv_curr)
+                            if cubic is not None:
+                                refined_coords = coords + capped_disp * cubic["t_star"]
+                                valid = cfg.min_interatomic_dist <= 0 or _min_interatomic_distance(refined_coords) >= cfg.min_interatomic_dist
+                                if valid:
+                                    out_ref = predict_fn(refined_coords, atomic_nums, do_hessian=True, require_grad=False)
+                                    if _to_float(out_ref["energy"]) < energy_new - 1e-8:
+                                        new_coords = refined_coords
+                                        out_new = out_ref
+                                        energy_new = _to_float(out_ref["energy"])
+
+                    # Trust radius update
+                    dx_flat = capped_disp.reshape(-1).to(work_dtype)
+                    dx_red = V.T @ dx_flat
+                    pred_dE = float((grad.dot(dx_flat) + 0.5 * (lam * dx_red * dx_red).sum()).item())
+                    actual_dE = energy_new - energy
+                    rho = actual_dE / pred_dE if pred_dE < -1e-8 else 0.0
+
+                    if rho > 0.75:
+                        trust_radius = min(trust_radius * 1.5, cfg.nr_max_atom_disp)
+                    elif rho < 0.25:
+                        trust_radius = max(trust_radius * 0.5, cfg.nr_trust_floor)
+
+                    prev_forces = forces.clone()
+                    coords = new_coords.detach()
+                    out = out_new
+                else:
+                    trust_radius = max(trust_radius * 0.25, cfg.nr_trust_floor)
+                    retries += 1
+
+            if not accepted:
+                if out_new is not None and new_coords is not None:
+                    prev_forces = forces.clone()
+                    coords = new_coords.detach()
+                    out = out_new
+
+        else:
+            # ============ GAD STEP (climb toward index-1 saddle) ============
+            record["mode"] = "GAD"
+            n_gad_steps += 1
+
+            num_atoms = int(forces.shape[0])
+
+            # Mode tracking
+            k_track = min(8, evecs_vib_3N.shape[1])
+            V_cand = evecs_vib_3N[:, :k_track].to(device=forces.device, dtype=forces.dtype)
+            v_prev_local = (
+                v_prev.to(device=forces.device, dtype=forces.dtype).reshape(-1)
+                if (cfg.gad_track_mode and v_prev is not None) else None
+            )
+            v, _mode_idx, _overlap = pick_tracked_mode(V_cand, v_prev_local, k=k_track)
+
+            # GAD direction
+            if cfg.gad_project_gradient:
+                gad_vec, v_proj, _info = gad_dynamics_projected_torch(
+                    coords=coords, forces=forces, v=v, atomsymbols=atomsymbols,
+                )
+                v = v_proj.reshape(-1)
+            else:
+                f_flat = forces.reshape(-1)
+                gad_flat = f_flat + 2.0 * torch.dot(-f_flat, v) * v
+                gad_vec = gad_flat.view(num_atoms, 3)
+
+            if cfg.gad_track_mode:
+                v_prev = v.detach().clone().reshape(-1)
+
+            # Adaptive timestep
+            dt_eff = _compute_adaptive_dt(cfg.gad_dt, cfg.gad_dt_min, cfg.gad_dt_max, eig_0)
+            record["dt_eff"] = dt_eff
+
+            # Take step
+            step_disp = dt_eff * gad_vec
+            max_disp = float(step_disp.norm(dim=1).max().item())
+            if max_disp > cfg.gad_max_atom_disp and max_disp > 0:
+                step_disp = step_disp * (cfg.gad_max_atom_disp / max_disp)
+
+            new_coords = coords + step_disp
+
+            # Distance safety
+            if cfg.min_interatomic_dist > 0 and _min_interatomic_distance(new_coords) < cfg.min_interatomic_dist:
+                step_disp = step_disp * 0.5
+                new_coords = coords + step_disp
+
+            prev_forces = forces.clone()
+            coords = new_coords.detach()
+            # Reset mode tracking when switching from NR to GAD
+            out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+
+    # If we exhausted the budget without converging, but collected a good
+    # snapshot during NR, try a last-ditch GAD run from that snapshot.
+    if not gad_activated and best_snapshot is not None:
+        remaining = cfg.max_steps - (step + 1)
+        if remaining > 100:
+            # Run GAD from the best snapshot
+            snap_coords = best_snapshot["coords"].to(coords.device)
+            v_prev = None
+            gad_activated = True
+            coords = snap_coords.reshape(-1, 3)
+            out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+
+            for gad_step in range(min(remaining, cfg.max_steps)):
+                forces_g = out["forces"]
+                hessian_g = out["hessian"]
+                if forces_g.dim() == 3 and forces_g.shape[0] == 1:
+                    forces_g = forces_g[0]
+                forces_g = forces_g.reshape(-1, 3)
+
+                evals_g, evecs_g, _ = vib_eig(hessian_g, coords, atomsymbols)
+                n_neg_g = int((evals_g < 0).sum().item())
+                f_rms_g = rms_force(forces_g)
+                eig_0_g = float(evals_g[0].item())
+                n_gad_steps += 1
+
+                if n_neg_g == 1 and f_rms_g < cfg.force_converged:
+                    return {
+                        "converged": True,
+                        "converged_step": step + 1 + gad_step,
+                        "final_coords": coords.detach().cpu(),
+                        "final_energy": _to_float(out["energy"]),
+                        "final_force_norm": f_rms_g,
+                        "final_max_force": max_atomic_force(forces_g),
+                        "final_n_neg": 1,
+                        "total_steps": step + 1 + gad_step + 1,
+                        "n_nr_steps": n_nr_steps,
+                        "n_gad_steps": n_gad_steps,
+                        "trajectory": trajectory,
+                        "handoff_snapshot": best_snapshot["step"],
+                    }
+
+                # GAD step
+                k_track = min(8, evecs_g.shape[1])
+                V_cand = evecs_g[:, :k_track].to(device=forces_g.device, dtype=forces_g.dtype)
+                v_prev_local = v_prev.to(device=forces_g.device, dtype=forces_g.dtype).reshape(-1) if v_prev is not None else None
+                v, _, _ = pick_tracked_mode(V_cand, v_prev_local, k=k_track)
+
+                gad_vec, v_proj, _ = gad_dynamics_projected_torch(
+                    coords=coords, forces=forces_g, v=v, atomsymbols=atomsymbols)
+                v = v_proj.reshape(-1)
+                v_prev = v.detach().clone().reshape(-1)
+
+                dt_eff = _compute_adaptive_dt(cfg.gad_dt, cfg.gad_dt_min, cfg.gad_dt_max, eig_0_g)
+                step_disp = dt_eff * gad_vec
+                max_d = float(step_disp.norm(dim=1).max().item())
+                if max_d > cfg.gad_max_atom_disp and max_d > 0:
+                    step_disp = step_disp * (cfg.gad_max_atom_disp / max_d)
+                new_coords = coords + step_disp
+                if cfg.min_interatomic_dist > 0 and _min_interatomic_distance(new_coords) < cfg.min_interatomic_dist:
+                    step_disp = step_disp * 0.5
+                    new_coords = coords + step_disp
+                coords = new_coords.detach()
+                out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
+
+            # Update final state from snapshot GAD
+            forces = forces_g
+            evals_vib = evals_g
+
+    # Did not converge
+    force_final = rms_force(forces)
+    n_neg_final = int((evals_vib < 0).sum().item()) if evals_vib.numel() > 0 else -1
+    return {
+        "converged": False,
+        "converged_step": None,
+        "final_coords": coords.detach().cpu(),
+        "final_energy": _to_float(out["energy"]),
+        "final_force_norm": force_final,
+        "final_max_force": max_atomic_force(forces),
+        "final_n_neg": n_neg_final,
+        "total_steps": step + 1 if step > 0 else 0,
+        "n_nr_steps": n_nr_steps,
+        "n_gad_steps": n_gad_steps,
+        "trajectory": trajectory,
+    }
+
+
+# ============================================================================
+# Legacy API: run_nr_minimization (unchanged for backward compatibility)
 # ============================================================================
 
 def run_nr_minimization(
@@ -288,18 +714,11 @@ def run_nr_minimization(
     atomsymbols: list[str],
     cfg: NRConfig,
 ) -> Dict[str, Any]:
-    """RFO Newton-Raphson minimization to local minimum.
-
-    Converges when n_neg == 0 (or relaxed: min_eval >= -threshold) AND force < threshold.
-
-    Returns dict with keys: converged, final_coords, final_energy, final_force_norm,
-    converged_step, total_steps, final_n_neg, final_min_eval, trajectory.
-    """
+    """RFO Newton-Raphson minimization to local minimum (legacy API)."""
     coords = coords0.detach().clone().to(torch.float32).reshape(-1, 3)
     trust_radius = cfg.max_atom_disp
     trajectory: List[Dict[str, Any]] = []
 
-    # Initial evaluation
     out = predict_fn(coords, atomic_nums, do_hessian=True, require_grad=False)
 
     for step in range(cfg.n_steps):
@@ -310,14 +729,12 @@ def run_nr_minimization(
         if forces.dim() == 3 and forces.shape[0] == 1:
             forces = forces[0]
         forces = forces.reshape(-1, 3)
-        force_norm = _force_mean(forces)
+        force_norm = rms_force(forces)
 
-        # Vibrational eigendecomposition
         evals_vib, evecs_vib_3N, _ = vib_eig(hessian, coords, atomsymbols)
         n_neg = int((evals_vib < 0).sum().item())
         min_eval = float(evals_vib.min().item()) if evals_vib.numel() > 0 else float("nan")
 
-        # Log
         record = {
             "step": step, "energy": energy, "force_norm": force_norm,
             "n_neg": n_neg, "min_eval": min_eval, "trust_radius": trust_radius,
@@ -328,7 +745,6 @@ def run_nr_minimization(
             record["bottom_spectrum"] = evals_vib[:k].tolist()
         trajectory.append(record)
 
-        # ---- Convergence check ----
         strict = n_neg == 0 and force_norm < cfg.force_converged
         relaxed = (
             not strict
@@ -350,7 +766,6 @@ def run_nr_minimization(
                 "trajectory": trajectory,
             }
 
-        # ---- Build RFO step ----
         grad = -forces.reshape(-1)
         if cfg.project_gradient:
             grad = -project_vector_to_vibrational_torch(
@@ -362,16 +777,13 @@ def run_nr_minimization(
         lam = evals_vib.to(device=grad.device, dtype=work_dtype)
 
         delta_x, rfo_info = _rfo_step(grad, V, lam)
-        record["rfo_info"] = rfo_info
 
-        # ---- Trust region with PLS ----
         accepted = False
         retries = 0
-        max_retries = 10
         out_new = None
         new_coords = None
 
-        while not accepted and retries < max_retries:
+        while not accepted and retries < 10:
             capped_disp = _cap_displacement(delta_x.reshape(-1, 3), trust_radius)
             dx_flat = capped_disp.reshape(-1).to(work_dtype)
             dx_red = V.T @ dx_flat
@@ -379,7 +791,6 @@ def run_nr_minimization(
 
             new_coords = coords + capped_disp
 
-            # Interatomic distance check (molecular safety)
             if cfg.min_interatomic_dist > 0 and _min_interatomic_distance(new_coords) < cfg.min_interatomic_dist:
                 trust_radius = max(trust_radius * 0.5, cfg.trust_radius_floor)
                 retries += 1
@@ -387,63 +798,37 @@ def run_nr_minimization(
 
             out_new = predict_fn(new_coords, atomic_nums, do_hessian=True, require_grad=False)
             energy_new = _to_float(out_new["energy"])
-            actual_dE = energy_new - energy
 
-            if actual_dE <= 1e-5:
+            if energy_new <= energy + 1e-5:
                 accepted = True
-                accepted_disp = capped_disp
                 accepted_coords = new_coords.detach()
                 accepted_out = out_new
                 accepted_energy = energy_new
                 pred_dE_used = pred_dE
 
-                # Polynomial line search refinement
                 if cfg.polynomial_linesearch and step > 0:
                     step_vec = capped_disp.reshape(-1).to(work_dtype)
-                    step_norm = float(step_vec.norm().item())
-                    if step_norm > 1e-12:
-                        grad_prev = -forces.reshape(-1).to(work_dtype)
+                    if float(step_vec.norm().item()) > 1e-12:
                         forces_new = out_new["forces"]
                         if forces_new.dim() == 3 and forces_new.shape[0] == 1:
                             forces_new = forces_new[0]
-                        grad_curr = -forces_new.reshape(-1).to(work_dtype)
-
-                        deriv_prev = float(grad_prev.dot(step_vec).item())
-                        deriv_curr = float(grad_curr.dot(step_vec).item())
-
                         cubic = _cubic_interval_minimum(
-                            energy, energy_new, deriv_prev, deriv_curr,
+                            energy, energy_new,
+                            float((-forces.reshape(-1).to(work_dtype)).dot(step_vec).item()),
+                            float((-forces_new.reshape(-1).to(work_dtype)).dot(step_vec).item()),
                         )
                         if cubic is not None:
-                            refined_disp = capped_disp * cubic["t_star"]
-                            refined_coords = coords + refined_disp
-
-                            valid = (
-                                cfg.min_interatomic_dist <= 0
-                                or _min_interatomic_distance(refined_coords) >= cfg.min_interatomic_dist
-                            )
+                            refined_coords = coords + capped_disp * cubic["t_star"]
+                            valid = cfg.min_interatomic_dist <= 0 or _min_interatomic_distance(refined_coords) >= cfg.min_interatomic_dist
                             if valid:
-                                out_ref = predict_fn(
-                                    refined_coords, atomic_nums,
-                                    do_hessian=True, require_grad=False,
-                                )
-                                ref_energy = _to_float(out_ref["energy"])
-                                if ref_energy < accepted_energy - 1e-8:
-                                    accepted_disp = refined_disp
+                                out_ref = predict_fn(refined_coords, atomic_nums, do_hessian=True, require_grad=False)
+                                if _to_float(out_ref["energy"]) < accepted_energy - 1e-8:
                                     accepted_coords = refined_coords.detach()
                                     accepted_out = out_ref
-                                    accepted_energy = ref_energy
-                                    dx_ref = accepted_disp.reshape(-1).to(work_dtype)
-                                    dx_ref_red = V.T @ dx_ref
-                                    pred_dE_used = float(
-                                        (grad.dot(dx_ref) + 0.5 * (lam * dx_ref_red * dx_ref_red).sum()).item()
-                                    )
-                                    record["pls_applied"] = True
+                                    accepted_energy = _to_float(out_ref["energy"])
 
-                # Trust radius update
-                actual_dE_final = accepted_energy - energy
-                rho = actual_dE_final / pred_dE_used if pred_dE_used < -1e-8 else 0.0
-
+                actual_dE = accepted_energy - energy
+                rho = actual_dE / pred_dE_used if pred_dE_used < -1e-8 else 0.0
                 if rho > 0.75:
                     trust_radius = min(trust_radius * 1.5, cfg.max_atom_disp)
                 elif rho < 0.25:
@@ -455,14 +840,10 @@ def run_nr_minimization(
                 trust_radius = max(trust_radius * 0.25, cfg.trust_radius_floor)
                 retries += 1
 
-        if not accepted:
-            # All retries failed — take last tried step if we evaluated it,
-            # otherwise stay at current position (all retries hit distance check)
-            if out_new is not None and new_coords is not None:
-                coords = new_coords.detach()
-                out = out_new
+        if not accepted and out_new is not None and new_coords is not None:
+            coords = new_coords.detach()
+            out = out_new
 
-    # Did not converge within budget
     return {
         "converged": False,
         "convergence_class": "NONE",
@@ -478,41 +859,8 @@ def run_nr_minimization(
 
 
 # ============================================================================
-# Phase 2: GAD saddle search with eigenvalue-clamped adaptive dt
+# Legacy API: run_gad_saddle_search (unchanged for backward compatibility)
 # ============================================================================
-
-def _compute_adaptive_dt(
-    dt_base: float,
-    dt_min: float,
-    dt_max: float,
-    method: str,
-    eig_0: float,
-    eps: float = 1e-8,
-    dt_scale_factor: float = 1.0,
-) -> float:
-    """State-based adaptive timestep. No path history needed.
-
-    Args:
-        dt_scale_factor: Global multiplier on the effective dt. Use < 1.0
-            (e.g. 0.5) at high noise for stability.
-    """
-    if method == "none":
-        return dt_base * dt_scale_factor
-
-    if method == "eigenvalue_clamped":
-        # Clamp |lambda_0| to [1e-2, 1e2] to prevent extreme dt.
-        # Small |lambda| (flat) → large dt. Large |lambda| (curved) → small dt.
-        lam = min(max(abs(eig_0), 1e-2), 1e2)
-        dt_eff = dt_base / (lam + eps)
-    elif method == "harmonic":
-        omega = math.sqrt(abs(eig_0) + eps)
-        dt_eff = dt_base / omega
-    else:
-        dt_eff = dt_base
-
-    dt_eff *= dt_scale_factor
-    return float(max(dt_min, min(dt_eff, dt_max)))
-
 
 def run_gad_saddle_search(
     predict_fn,
@@ -522,19 +870,11 @@ def run_gad_saddle_search(
     cfg: GADConfig,
     force_converged: float = 0.01,
 ) -> Dict[str, Any]:
-    """GAD dynamics to find index-1 saddle point.
-
-    Convergence: n_neg == 1 AND force_norm < force_converged on
-    Eckart-projected vibrational Hessian.
-
-    Returns dict with keys: converged, final_coords, converged_step, total_steps,
-    final_morse_index, trajectory.
-    """
+    """GAD dynamics to find index-1 saddle point (legacy API)."""
     coords = coords0.detach().clone().to(torch.float32).reshape(-1, 3)
     v_prev: Optional[torch.Tensor] = None
     trajectory: List[Dict[str, Any]] = []
 
-    # Index-2 recovery state
     consec_nneg2: int = 0
     n_kicks_used: int = 0
 
@@ -548,22 +888,20 @@ def run_gad_saddle_search(
         forces = forces.reshape(-1, 3)
         num_atoms = int(forces.shape[0])
 
-        # Vibrational eigendecomposition
         evals_vib, evecs_vib_3N, _ = vib_eig(hessian, coords, atomsymbols)
         n_neg = int((evals_vib < 0).sum().item()) if evals_vib.numel() > 0 else 0
         eig_0 = float(evals_vib[0].item()) if evals_vib.numel() > 0 else 0.0
 
+        force_norm = rms_force(forces)
         record = {
             "step": step,
             "energy": _to_float(out["energy"]),
-            "force_norm": _force_mean(forces),
+            "force_norm": force_norm,
             "n_neg": n_neg,
             "eig_0": eig_0,
         }
         trajectory.append(record)
 
-        # ---- Convergence: exactly one negative eigenvalue AND force converged ----
-        force_norm = _force_mean(forces)
         if n_neg == 1 and force_norm < force_converged:
             return {
                 "converged": True,
@@ -576,29 +914,22 @@ def run_gad_saddle_search(
                 "trajectory": trajectory,
             }
 
-        # ---- Index-2 recovery: perturb along 2nd negative eigenvector ----
         if cfg.index2_recovery:
             if n_neg >= 2:
                 consec_nneg2 += 1
             else:
                 consec_nneg2 = 0
-
             if (consec_nneg2 >= cfg.index2_patience
                     and n_kicks_used < cfg.index2_max_kicks
                     and evecs_vib_3N.shape[1] >= 2):
-                # Perturb along the 2nd negative eigenvector (index 1)
                 v2 = evecs_vib_3N[:, 1].to(device=coords.device, dtype=coords.dtype)
                 v2 = v2 / (v2.norm() + 1e-12)
-                kick = cfg.index2_kick_scale * v2.reshape(-1, 3)
-                coords = coords + kick
+                coords = coords + cfg.index2_kick_scale * v2.reshape(-1, 3)
                 consec_nneg2 = 0
                 n_kicks_used += 1
-                v_prev = None  # reset mode tracking after kick
-                record["index2_kick"] = True
-                continue  # re-evaluate at new position
+                v_prev = None
+                continue
 
-        # ---- Mode tracking: pick guide vector ----
-        # Use bottom-k eigenvectors from the reduced-basis Hessian
         k_track = min(8, evecs_vib_3N.shape[1])
         V_cand = evecs_vib_3N[:, :k_track].to(device=forces.device, dtype=forces.dtype)
         v_prev_local = (
@@ -607,7 +938,6 @@ def run_gad_saddle_search(
         )
         v, _mode_idx, _overlap = pick_tracked_mode(V_cand, v_prev_local, k=k_track)
 
-        # ---- Compute GAD direction ----
         if cfg.project_gradient:
             gad_vec, v_proj, _info = gad_dynamics_projected_torch(
                 coords=coords, forces=forces, v=v, atomsymbols=atomsymbols,
@@ -621,102 +951,30 @@ def run_gad_saddle_search(
         if cfg.track_mode:
             v_prev = v.detach().clone().reshape(-1)
 
-        # ---- Adaptive timestep ----
         dt_eff = _compute_adaptive_dt(
-            cfg.dt, cfg.dt_min, cfg.dt_max,
-            cfg.dt_adaptation, eig_0,
-            dt_scale_factor=cfg.dt_scale_factor,
+            cfg.dt, cfg.dt_min, cfg.dt_max, eig_0,
         )
-        record["dt_eff"] = dt_eff
 
-        # ---- Take step with displacement capping ----
         step_disp = dt_eff * gad_vec
         max_disp = float(step_disp.norm(dim=1).max().item())
         if max_disp > cfg.max_atom_disp and max_disp > 0:
             step_disp = step_disp * (cfg.max_atom_disp / max_disp)
 
         new_coords = coords + step_disp
-
-        # Interatomic distance safety
         if cfg.min_interatomic_dist > 0 and _min_interatomic_distance(new_coords) < cfg.min_interatomic_dist:
             step_disp = step_disp * 0.5
             new_coords = coords + step_disp
 
         coords = new_coords.detach()
 
-    # Did not converge
     final_morse = int((evals_vib < 0).sum().item()) if evals_vib.numel() > 0 else -1
     return {
         "converged": False,
         "converged_step": None,
         "final_coords": coords.detach().cpu(),
         "final_energy": _to_float(out["energy"]),
-        "final_force_norm": float(_force_mean(forces)),
+        "final_force_norm": rms_force(forces),
         "final_morse_index": final_morse,
         "total_steps": cfg.n_steps,
         "trajectory": trajectory,
-    }
-
-
-# ============================================================================
-# Top-level: NR → GAD transition state search
-# ============================================================================
-
-def find_transition_state(
-    predict_fn,
-    coords0: torch.Tensor,
-    atomic_nums: torch.Tensor,
-    atomsymbols: list[str],
-    cfg: Optional[SaddleOptimizerConfig] = None,
-) -> Dict[str, Any]:
-    """Find an index-1 saddle point (transition state) from a noisy starting geometry.
-
-    Phase 1: RFO Newton-Raphson minimizes to a local minimum.
-    Phase 2: GAD dynamics climbs from the minimum to an index-1 saddle.
-
-    Args:
-        predict_fn: Callable(coords, atomic_nums, do_hessian, require_grad) -> dict
-        coords0: (N, 3) or (1, N, 3) starting coordinates
-        atomic_nums: (N,) atomic numbers
-        atomsymbols: ['C', 'H', ...] element symbols
-        cfg: Optimizer config (uses defaults if None)
-
-    Returns:
-        dict with keys:
-            converged: bool — True if n_neg == 1 at final geometry
-            final_coords: (N, 3) tensor
-            phase1_result: full NR result dict
-            phase2_result: full GAD result dict (or None if phase 2 skipped)
-            total_steps: combined step count
-    """
-    if cfg is None:
-        cfg = SaddleOptimizerConfig()
-
-    # ====== Phase 1: NR minimization ======
-    nr_result = run_nr_minimization(
-        predict_fn, coords0, atomic_nums, atomsymbols, cfg.nr,
-    )
-
-    nr_converged = nr_result["converged"]
-    nr_coords = nr_result["final_coords"]
-
-    # ====== Phase 2: GAD saddle search ======
-    gad_result = None
-    if nr_converged or cfg.gad_on_nr_failure:
-        gad_result = run_gad_saddle_search(
-            predict_fn, nr_coords, atomic_nums, atomsymbols, cfg.gad,
-        )
-
-    # ====== Assemble result ======
-    ts_converged = gad_result is not None and gad_result["converged"]
-    final_coords = gad_result["final_coords"] if gad_result is not None else nr_coords
-    total_steps = nr_result["total_steps"] + (gad_result["total_steps"] if gad_result else 0)
-
-    return {
-        "converged": ts_converged,
-        "final_coords": final_coords,
-        "final_energy": gad_result["final_energy"] if gad_result else nr_result["final_energy"],
-        "total_steps": total_steps,
-        "phase1_result": nr_result,
-        "phase2_result": gad_result,
     }

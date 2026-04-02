@@ -1,0 +1,48 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\providecommand\HyperFirstAtBeginDocument{\AtBeginDocument}
+\HyperFirstAtBeginDocument{\ifx\hyper@anchor\@undefined
+\global\let\oldcontentsline\contentsline
+\gdef\contentsline#1#2#3#4{\oldcontentsline{#1}{#2}{#3}}
+\global\let\oldnewlabel\newlabel
+\gdef\newlabel#1#2{\newlabelxx{#1}#2}
+\gdef\newlabelxx#1#2#3#4#5#6{\oldnewlabel{#1}{{#2}{#3}}}
+\AtEndDocument{\ifx\hyper@anchor\@undefined
+\let\contentsline\oldcontentsline
+\let\newlabel\oldnewlabel
+\fi}
+\fi}
+\global\let\hyper@last\relax 
+\gdef\HyperFirstAtBeginDocument#1{#1}
+\providecommand\HyField@AuxAddToFields[1]{}
+\providecommand\HyField@AuxAddToCoFields[2]{}
+\@writefile{toc}{\contentsline {section}{\numberline {1}Setup}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {2}Structure vs.\ Energy: No Correlation}{2}{section.2}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Pairwise aligned RMSD vs.\ energy difference (left) and curvature difference (right) for all $\binom  {74}{2} = 2701$ TS pairs. There is no correlation: pairs at RMSD $\sim 0.5$\nobreakspace  {}\r A{} span 0--6\nobreakspace  {}eV in energy. Curvature (lowest eigenvalue) shows similarly no correlation with structural distance. This means RMSD alone cannot distinguish chemically distinct TS families.\relax }}{2}{figure.caption.1}\protected@file@percent }
+\providecommand*\caption@xref[2]{\@setref\relax\@undefined{#1}}
+\newlabel{fig:scatter}{{1}{2}{Pairwise aligned RMSD vs.\ energy difference (left) and curvature difference (right) for all $\binom {74}{2} = 2701$ TS pairs. There is no correlation: pairs at RMSD $\sim 0.5$~\AA {} span 0--6~eV in energy. Curvature (lowest eigenvalue) shows similarly no correlation with structural distance. This means RMSD alone cannot distinguish chemically distinct TS families.\relax }{figure.caption.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Is There a Natural Cluster Count?}{2}{section.3}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Left: distribution of intra-energy-group and inter-energy-group RMSD. Heavy overlap: the distributions are not separable, so no RMSD threshold cleanly distinguishes same-energy from different-energy TS pairs. Right: within-group RMSD spread per energy group. Most groups have 0.3--1.0\nobreakspace  {}\r A{} internal spread.\relax }}{3}{figure.caption.2}\protected@file@percent }
+\newlabel{fig:bands}{{2}{3}{Left: distribution of intra-energy-group and inter-energy-group RMSD. Heavy overlap: the distributions are not separable, so no RMSD threshold cleanly distinguishes same-energy from different-energy TS pairs. Right: within-group RMSD spread per energy group. Most groups have 0.3--1.0~\AA {} internal spread.\relax }{figure.caption.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Cross-Method Agreement}{3}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Dendrogram with Chemical Features}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Embedding Visualizations}{3}{section.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Quantitative Comparison}{3}{section.7}\protected@file@percent }
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Best methods by each criterion.\relax }}{3}{table.caption.10}\protected@file@percent }
+\newlabel{tab:best}{{1}{3}{Best methods by each criterion.\relax }{table.caption.10}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Left: histogram of cluster counts across all 131 methods. Most methods produce $k = 7$ or $k = 31$; no single $k$ dominates. Right: silhouette score vs.\ $k$ for hierarchical average linkage. Silhouette is highest at $k = 2$ (trivial split) and at high $k$ ($\sim 29$, many singletons). No clear elbow suggests there is no single ``correct'' number of structural clusters.\relax }}{4}{figure.caption.3}\protected@file@percent }
+\newlabel{fig:kcount}{{3}{4}{Left: histogram of cluster counts across all 131 methods. Most methods produce $k = 7$ or $k = 31$; no single $k$ dominates. Right: silhouette score vs.\ $k$ for hierarchical average linkage. Silhouette is highest at $k = 2$ (trivial split) and at high $k$ ($\sim 29$, many singletons). No clear elbow suggests there is no single ``correct'' number of structural clusters.\relax }{figure.caption.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusions}{4}{section.8}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Pairwise ARI between representative methods from each algorithm family. Hierarchical complete and average linkage at threshold 0.2\nobreakspace  {}\r A{} agree perfectly (ARI $= 1.0$). Hierarchical methods agree moderately with each other (0.3--0.5). DBSCAN/OPTICS form their own block (ARI $\sim 0.6$). Spectral and KMeans show low agreement with everything ($< 0.2$). Overall mean ARI $= 0.25$.\relax }}{5}{figure.caption.4}\protected@file@percent }
+\newlabel{fig:agreement}{{4}{5}{Pairwise ARI between representative methods from each algorithm family. Hierarchical complete and average linkage at threshold 0.2~\AA {} agree perfectly (ARI $= 1.0$). Hierarchical methods agree moderately with each other (0.3--0.5). DBSCAN/OPTICS form their own block (ARI $\sim 0.6$). Spectral and KMeans show low agreement with everything ($< 0.2$). Overall mean ARI $= 0.25$.\relax }{figure.caption.4}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {5}{\ignorespaces Hierarchical clustering dendrogram (average linkage) with energy (top color bar) and lowest eigenvalue (bottom color bar) mapped onto the leaf order. Adjacent leaves in the dendrogram often have different energy colors, confirming that structural proximity $\neq  $ energy proximity. The red dashed line at 0.2\nobreakspace  {}\r A{} is the original clustering threshold.\relax }}{6}{figure.caption.5}\protected@file@percent }
+\newlabel{fig:dendro}{{5}{6}{Hierarchical clustering dendrogram (average linkage) with energy (top color bar) and lowest eigenvalue (bottom color bar) mapped onto the leaf order. Adjacent leaves in the dendrogram often have different energy colors, confirming that structural proximity $\neq $ energy proximity. The red dashed line at 0.2~\AA {} is the original clustering threshold.\relax }{figure.caption.5}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {6}{\ignorespaces t-SNE embeddings at perplexity 5, 10, 15, 30 (columns). Top: colored by energy. Bottom: colored by energy cluster assignment. Low perplexity (5) fragments into tight micro-clusters that mix energies. High perplexity (30) shows broader structure but still no clean energy separation. Perplexity 15 provides the best balance.\relax }}{6}{figure.caption.6}\protected@file@percent }
+\newlabel{fig:tsne}{{6}{6}{t-SNE embeddings at perplexity 5, 10, 15, 30 (columns). Top: colored by energy. Bottom: colored by energy cluster assignment. Low perplexity (5) fragments into tight micro-clusters that mix energies. High perplexity (30) shows broader structure but still no clean energy separation. Perplexity 15 provides the best balance.\relax }{figure.caption.6}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {7}{\ignorespaces The ``best'' RMSD-based method (spectral, $\sigma = 0.56$, $k = 8$; ARI $= 0.05$). Top row: MDS embedding colored by cluster assignment, energy, and lowest eigenvalue. Bottom row: t-SNE (perp$= 30$) colored by cluster and energy, plus energy vs.\ curvature scatter. Even the best method produces clusters that span 2+\nobreakspace  {}eV in energy.\relax }}{7}{figure.caption.7}\protected@file@percent }
+\newlabel{fig:best}{{7}{7}{The ``best'' RMSD-based method (spectral, $\sigma = 0.56$, $k = 8$; ARI $= 0.05$). Top row: MDS embedding colored by cluster assignment, energy, and lowest eigenvalue. Bottom row: t-SNE (perp$= 30$) colored by cluster and energy, plus energy vs.\ curvature scatter. Even the best method produces clusters that span 2+~eV in energy.\relax }{figure.caption.7}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {8}{\ignorespaces MDS embedding colored by the top 6 clustering methods (ranked by ARI). First two panels show energy coloring and energy cluster ground truth. All methods produce visually different cluster assignments, and none matches the energy coloring.\relax }}{7}{figure.caption.8}\protected@file@percent }
+\newlabel{fig:grid}{{8}{7}{MDS embedding colored by the top 6 clustering methods (ranked by ARI). First two panels show energy coloring and energy cluster ground truth. All methods produce visually different cluster assignments, and none matches the energy coloring.\relax }{figure.caption.8}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {9}{\ignorespaces Top 20 methods ranked by ARI (top), silhouette (middle), and energy coherence (bottom). Methods that score well on silhouette (DBSCAN, high $k$) score poorly on energy coherence, and vice versa. No method scores well on all three metrics simultaneously.\relax }}{8}{figure.caption.9}\protected@file@percent }
+\newlabel{fig:metrics}{{9}{8}{Top 20 methods ranked by ARI (top), silhouette (middle), and energy coherence (bottom). Methods that score well on silhouette (DBSCAN, high $k$) score poorly on energy coherence, and vice versa. No method scores well on all three metrics simultaneously.\relax }{figure.caption.9}{}}
+\gdef \@abspage@last{8}

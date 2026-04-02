@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git push:*)",
+      "Bash(squeue -u memoozd)",
+      "Read(//project/rrg-aspuru/memoozd/**)",
+      "Read(//scratch/memoozd/diffusion-ts/structural_clustering/**)",
+      "Read(//scratch/memoozd/diffusion-ts/structural_clustering_v3/**)"
+    ]
+  }
+}

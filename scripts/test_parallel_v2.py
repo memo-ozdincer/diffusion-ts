@@ -1,10 +1,13 @@
 #!/usr/bin/env python
-"""Parallel TS search: 10 random isopropanol starts, early NR→GAD handoff.
+"""Parallel TS search v2: improved convergence at high noise levels.
 
-Strategy (proven on single geometry):
-  1. NR from 0.2A-noisy geometry (saves coords at each step)
-  2. Hand off to GAD at first n_neg=1 snapshot
-  3. GAD Euler moderate (dt=0.01, dt_max=0.3, max_disp=0.5) until n_neg=1 AND force<0.01
+Changes from v1 (test_parallel_quick.py):
+  - Lower min_dist skip threshold (0.3A instead of 0.5A)
+  - More NR steps (1000) for better trajectory sampling
+  - Expanded candidate set: also try minimum (n_neg=0) handoff with eigvec perturbation
+  - More GAD steps (5000) with adjusted parameters
+  - Restart-from-minimum strategy when main candidates fail
+  - Wider spread of handoff candidates (middle n_neg=1 points too)
 """
 
 import sys, os, time, json, torch
@@ -24,8 +27,16 @@ ATOMIC_NUMS = torch.tensor([6, 6, 6, 8, 1, 1, 1, 1, 1, 1, 1, 1])
 ATOMSYMBOLS = ["C", "C", "C", "O", "H", "H", "H", "H", "H", "H", "H", "H"]
 
 
-def worker(seed, noise_std=0.2):
-    """Single TS search: NR (early handoff at n_neg=1) → GAD moderate."""
+def _min_dist(coords):
+    """Minimum interatomic distance."""
+    c = coords.reshape(-1, 3)
+    diff = c.unsqueeze(0) - c.unsqueeze(1)
+    dist = diff.norm(dim=2) + torch.eye(c.shape[0]) * 1e10
+    return float(dist.min().item())
+
+
+def worker(seed, noise_std=0.3):
+    """Single TS search with improved strategy for high noise."""
     os.environ["OMP_NUM_THREADS"] = "2"
     os.environ["OPENBLAS_NUM_THREADS"] = "2"
     os.environ["MKL_NUM_THREADS"] = "2"
@@ -36,7 +47,6 @@ def worker(seed, noise_std=0.2):
     from src.core_algos.saddle_optimizer import (
         run_nr_minimization, NRConfig,
         run_gad_saddle_search, GADConfig as SOGADConfig,
-        run_ts_refinement, TSRefinementConfig,
         vib_eig,
     )
 
@@ -47,50 +57,84 @@ def worker(seed, noise_std=0.2):
     torch.manual_seed(seed)
     noisy_coords = ISOPROPANOL_COORDS + torch.randn_like(ISOPROPANOL_COORDS) * noise_std
 
-    # Check min interatomic distance
-    c = noisy_coords.reshape(-1, 3)
-    diff = c.unsqueeze(0) - c.unsqueeze(1)
-    dist = diff.norm(dim=2) + torch.eye(c.shape[0]) * 1e10
-    min_dist = float(dist.min().item())
-    if min_dist < 0.5:
-        return {"seed": seed, "status": "skip", "reason": f"min_dist={min_dist:.3f}"}
+    # Lowered min_dist threshold: 0.3A instead of 0.5A
+    min_d = _min_dist(noisy_coords)
+    if min_d < 0.3:
+        return {"seed": seed, "status": "skip", "reason": f"min_dist={min_d:.3f}"}
 
     t0 = time.time()
 
-    # Phase 1: NR (500 steps, will stop early if converged)
-    nr_cfg = NRConfig(n_steps=500, force_converged=0.01)
+    # ========== Phase 1: NR (more steps for better trajectory) ==========
+    nr_cfg = NRConfig(n_steps=1000, force_converged=0.01, min_interatomic_dist=0.3)
     nr_result = run_nr_minimization(predict_fn, noisy_coords, ATOMIC_NUMS, ATOMSYMBOLS, nr_cfg)
 
-    # Collect ALL n_neg=1 snapshots (use last one — more relaxed geometry)
-    nneg1_points = [rec for rec in nr_result["trajectory"] if rec["n_neg"] == 1 and "coords" in rec]
-    nneg2_points = [rec for rec in nr_result["trajectory"] if rec["n_neg"] == 2 and "coords" in rec]
+    # Collect snapshots by n_neg value
+    traj = nr_result["trajectory"]
+    nneg0_points = [rec for rec in traj if rec["n_neg"] == 0 and "coords" in rec]
+    nneg1_points = [rec for rec in traj if rec["n_neg"] == 1 and "coords" in rec]
+    nneg2_points = [rec for rec in traj if rec["n_neg"] == 2 and "coords" in rec]
+    nneg3_points = [rec for rec in traj if rec["n_neg"] == 3 and "coords" in rec]
 
-    # Build candidate handoff list: last n_neg=1 first, then first n_neg=1, then last n_neg=2
+    # ========== Build expanded candidate list ==========
     candidates = []
+
+    # Priority 1: n_neg=1 points (best handoff)
     if nneg1_points:
         candidates.append(("last_nneg1", nneg1_points[-1]))
+        # Add middle point too (not just first/last)
+        if len(nneg1_points) > 2:
+            mid = len(nneg1_points) // 2
+            candidates.append(("mid_nneg1", nneg1_points[mid]))
         if len(nneg1_points) > 1:
             candidates.append(("first_nneg1", nneg1_points[0]))
+
+    # Priority 2: n_neg=2 points
     if nneg2_points:
         candidates.append(("last_nneg2", nneg2_points[-1]))
+        if len(nneg2_points) > 1:
+            candidates.append(("first_nneg2", nneg2_points[0]))
+
+    # Priority 3: n_neg=3 (early trajectory, high index)
+    if nneg3_points:
+        candidates.append(("last_nneg3", nneg3_points[-1]))
+
+    # Priority 4: n_neg=0 minimum with perturbation along lowest eigenvector
+    if nneg0_points and nr_result["converged"]:
+        # Use the converged minimum -- we'll perturb it
+        min_coords = nr_result["final_coords"]
+        out_min = predict_fn(min_coords, ATOMIC_NUMS, do_hessian=True)
+        evals_min, evecs_min, _ = vib_eig(out_min["hessian"], min_coords, ATOMSYMBOLS)
+
+        # Perturb along lowest eigenvector (most likely TS direction)
+        v0 = evecs_min[:, 0].reshape(-1, 3).to(min_coords.dtype)
+        for scale in [0.3, 0.5, -0.3]:
+            perturbed = min_coords + scale * v0
+            if _min_dist(perturbed) >= 0.3:
+                fake_rec = {"step": -1, "n_neg": 0, "coords": perturbed}
+                candidates.append((f"min_perturb_{scale}", fake_rec))
 
     if not candidates:
         return {
             "seed": seed, "status": "no_handoff",
-            "reason": "n_neg never reached 1 or 2 during NR",
+            "reason": "no suitable handoff point found",
             "nr_steps": nr_result["total_steps"],
             "wall": time.time() - t0,
         }
 
-    # Phase 2: Try GAD from each candidate until one works
+    # ========== Phase 2: GAD with expanded parameters ==========
     gad_cfg = SOGADConfig(
-        n_steps=3000,
+        n_steps=5000,
         dt=0.01,
         dt_max=0.3,
         max_atom_disp=0.5,
+        min_interatomic_dist=0.3,
     )
 
     best_result = None
+    best_label = None
+    best_step = None
+    best_nneg = None
+
     for label, rec in candidates:
         gad_result = run_gad_saddle_search(
             predict_fn, rec["coords"], ATOMIC_NUMS, ATOMSYMBOLS, gad_cfg)
@@ -127,30 +171,16 @@ def worker(seed, noise_std=0.2):
         "final_energy": gad_result["final_energy"],
         "final_morse_idx": gad_result["final_morse_index"],
         "final_force": gad_result.get("final_force_norm", None),
+        "n_candidates_tried": len(candidates),
         "wall": wall,
     }
 
     if gad_result["converged"]:
-        # Phase 3: Continued GAD to push force → 0
-        refine_cfg = TSRefinementConfig(
-            enabled=True, n_steps=1000, force_converged=1e-3,
-        )
-        refine_result = run_ts_refinement(
-            predict_fn, gad_result["final_coords"],
-            ATOMIC_NUMS, ATOMSYMBOLS, refine_cfg,
-        )
-
-        ts_coords = refine_result["final_coords"]
+        ts_coords = gad_result["final_coords"]
         out_ts = predict_fn(ts_coords, ATOMIC_NUMS, do_hessian=True)
         evals_ts, _, _ = vib_eig(out_ts["hessian"], ts_coords, ATOMSYMBOLS)
         result["ts_eig0"] = float(evals_ts[0])
         result["ts_coords"] = ts_coords.tolist()
-        result["gad_force"] = gad_result.get("final_force_norm", None)
-        result["refined_force"] = refine_result["final_force_norm"]
-        result["refine_steps"] = refine_result["total_steps"]
-        result["refine_converged"] = refine_result["converged"]
-        result["final_force"] = refine_result["final_force_norm"]
-        result["final_energy"] = refine_result["final_energy"]
 
     return result
 
@@ -158,19 +188,17 @@ def worker(seed, noise_std=0.2):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-seeds", type=int, default=10)
-    parser.add_argument("--n-workers", type=int, default=10)
-    parser.add_argument("--noise", type=float, default=0.2)
+    parser.add_argument("--n-seeds", type=int, default=50)
+    parser.add_argument("--n-workers", type=int, default=25)
+    parser.add_argument("--noise", type=float, default=0.3)
     parser.add_argument("--functional", type=str, default="DFTB0")
     parser.add_argument("--seed-start", type=int, default=0)
     args = parser.parse_args()
 
     seeds = list(range(args.seed_start, args.seed_start + args.n_seeds))
-
-    # Pass functional to workers via environment
     os.environ["TS_FUNCTIONAL"] = args.functional
 
-    print(f"Parallel TS search: {args.n_seeds} seeds, {args.n_workers} workers, "
+    print(f"Parallel TS search v2: {args.n_seeds} seeds, {args.n_workers} workers, "
           f"noise={args.noise}A, functional={args.functional}")
     print(f"Seeds: {seeds}")
     print()
@@ -184,50 +212,54 @@ def main():
             try:
                 r = fut.result()
                 results.append(r)
-                # Print as they complete
                 if r["status"] == "ts":
-                    gf = r.get('gad_force', '?')
-                    rf = r.get('refined_force', '?')
-                    gf_str = f"{gf:.6f}" if isinstance(gf, float) else str(gf)
-                    rf_str = f"{rf:.6f}" if isinstance(rf, float) else str(rf)
                     print(f"  seed={r['seed']:3d} TS! E={r['final_energy']:.4f} "
                           f"eig0={r.get('ts_eig0', '?'):.4f} "
-                          f"F: {gf_str}→{rf_str} "
-                          f"NR={r['nr_steps']}→GAD={r['gad_steps']}"
-                          f"→ref={r.get('refine_steps', 0)} "
+                          f"NR={r['nr_steps']}->GAD={r['gad_steps']} "
                           f"{r.get('handoff_label','?')}@step{r['handoff_step']} "
+                          f"tried={r.get('n_candidates_tried', '?')} "
                           f"{r['wall']:.1f}s")
                 elif r["status"] == "no_ts":
                     print(f"  seed={r['seed']:3d} no TS  morse={r['final_morse_idx']} "
                           f"F={r.get('final_force', '?'):.4f} "
                           f"{r.get('handoff_label','?')}@step{r['handoff_step']} "
-                          f"NR={r['nr_steps']}→GAD={r['gad_steps']} {r['wall']:.1f}s")
+                          f"tried={r.get('n_candidates_tried', '?')} "
+                          f"NR={r['nr_steps']}->GAD={r['gad_steps']} {r['wall']:.1f}s")
                 else:
                     print(f"  seed={r['seed']:3d} {r['status']}: {r.get('reason', '')}")
             except Exception as e:
                 print(f"  seed={seed} CRASH: {e}")
+                import traceback; traceback.print_exc()
                 results.append({"seed": seed, "status": "crash", "reason": str(e)})
 
     total_wall = time.time() - t0
 
-    # Summary
     n_ts = sum(1 for r in results if r["status"] == "ts")
     n_no_ts = sum(1 for r in results if r["status"] == "no_ts")
     n_skip = sum(1 for r in results if r["status"] in ("skip", "no_handoff", "crash"))
 
     print(f"\n{'='*60}")
     print(f"Summary: {n_ts}/{len(seeds)} TS found  ({n_no_ts} no_ts, {n_skip} skip/crash)")
+    print(f"Convergence rate: {n_ts}/{len(seeds)} = {100*n_ts/len(seeds):.0f}%")
+    print(f"Rate excl. skips: {n_ts}/{n_ts+n_no_ts} = {100*n_ts/(n_ts+n_no_ts):.0f}%" if (n_ts+n_no_ts) > 0 else "")
     print(f"Wall time: {total_wall:.1f}s  ({total_wall/len(seeds):.1f}s/sample sequential equiv)")
     print(f"{'='*60}")
 
-    # Save results
+    # Failure analysis
+    no_ts_results = [r for r in results if r["status"] == "no_ts"]
+    if no_ts_results:
+        print("\nFailure analysis:")
+        for r in sorted(no_ts_results, key=lambda x: x["seed"]):
+            print(f"  seed={r['seed']:3d} morse={r['final_morse_idx']} "
+                  f"F={r.get('final_force', '?'):.4f} "
+                  f"{r.get('handoff_label','?')} tried={r.get('n_candidates_tried', '?')}")
+
     out_dir = os.environ.get("SCRATCH_DIR", "/scratch/memoozd/diffusion-ts")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "parallel_results.json")
-    serializable = results  # ts_coords already .tolist()'d
+    out_path = os.path.join(out_dir, "parallel_results_v2.json")
     with open(out_path, "w") as f:
-        json.dump(serializable, f, indent=2)
-    print(f"Results saved to {out_path}")
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to {out_path}")
 
 
 if __name__ == "__main__":
